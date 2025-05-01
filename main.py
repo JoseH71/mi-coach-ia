@@ -8,11 +8,14 @@ app = Flask(__name__)
 def run_script():
     try:
         result = subprocess.run(["python3", "intervals_to_telegram.py"], capture_output=True, text=True, timeout=60)
-        return f"✅ Script ejecutado:<br><pre>{result.stdout}</pre><br>❌ Errores:<br><pre>{result.stderr}</pre>"
+        if result.returncode == 0:
+            return "OK"
+        else:
+            return f"Error: Script failed with code {result.returncode}"
     except Exception as e:
-        return f"❌ Error al ejecutar: {e}"
+        return f"Error: {str(e)}"
 
 if __name__ == "__main__":
     print("Iniciando servidor Flask...")
-    port = int(os.getenv("PORT", 81))  # Usa el puerto de Render, o 81 por defecto
+    port = int(os.getenv("PORT", 8080))  # Usa el puerto de Render, o 8080 por defecto
     app.run(host="0.0.0.0", port=port)
