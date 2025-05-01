@@ -1,19 +1,8 @@
 from flask import Flask
 import subprocess
-import threading
-import requests
-import time
+import os
 
 app = Flask(__name__)
-
-def keep_alive():
-    while True:
-        try:
-            requests.get("https://2f157143-8fca-4101-9afd-e18cff3014f1-00-1uczx4z8868kv.picard.replit.dev/")
-            print("Ping interno enviado")
-        except:
-            print("Error en ping interno")
-        time.sleep(300)  # Ping cada 5 minutos
 
 @app.route("/")
 def run_script():
@@ -24,5 +13,6 @@ def run_script():
         return f"❌ Error al ejecutar: {e}"
 
 if __name__ == "__main__":
-    threading.Thread(target=keep_alive, daemon=True).start()  # Inicia el keep-alive en segundo plano
-    app.run(host="0.0.0.0", port=81)
+    print("Iniciando servidor Flask...")
+    port = int(os.getenv("PORT", 81))  # Usa el puerto de Render, o 81 por defecto
+    app.run(host="0.0.0.0", port=port)
