@@ -2,10 +2,9 @@ import requests
 import base64
 from datetime import datetime, timedelta
 
-# ✅ Mensaje inicial para confirmar ejecución
 print("🏃 Script de Jose listo para correr")
 
-# 🔐 Configuración de Intervals.icu
+# Configuración de Intervals.icu
 api_key = "27i9azt55smmhvg1ogc5gmn7x"
 athlete_id = "i10474"
 base_url = "https://intervals.icu/api/v1"
@@ -13,105 +12,105 @@ auth_str = f"API_KEY:{api_key}"
 encoded_auth = base64.b64encode(auth_str.encode()).decode()
 headers = {"Authorization": f"Basic {encoded_auth}"}
 
-# 🔐 Configuración de Telegram
+# Configuración de Telegram
 telegram_token = "7783495659:AAHw0NOvktsz_IxQQJl3SmKiWWDm92gCNZk"
 chat_id = "720749629"
 
-# ✅ Función para enviar mensaje a Telegram
 def send_telegram_message(message):
     telegram_url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     response = requests.post(telegram_url, json=payload)
-    if response.status_code == 200:
-        print("📬 Mensaje enviado a Telegram")
-    else:
-        print(f"❌ Error al enviar mensaje: {response.status_code} - {response.text}")
+    print("📬 Mensaje enviado" if response.status_code == 200 else f"❌ Error: {response.status_code}")
 
-# 📅 Fecha dinámica
-today = datetime.now()
-newest = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-oldest = newest
-
-# 📥 Obtener datos de wellness
 def fetch_wellness_data(start, end):
     url = f"{base_url}/athlete/{athlete_id}/wellness?oldest={start}&newest={end}"
     response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json() or []
-    print(f"❌ Error al obtener datos: {response.status_code} - {response.text}")
-    return []
+    return response.json() if response.status_code == 200 else []
 
-# 📊 Procesar datos de un día
 def process_data(data):
     if not data:
         return None
     d = data[-1]
     return {
-        'BodyBatteryMax': d.get('BodyBatteryMax', 'N/A'),
-        'BodyBatteryMin': d.get('BodyBatteryMin', 'N/A'),
-        'RHR': d.get('restingHR', 'N/A'),
-        'HRV': d.get('hrv', 'N/A'),
-        'SleepScore': d.get('sleepScore', 'N/A')
+        'RHR': d.get('restingHR', 0) or 0,
+        'HRV': d.get('hrv', 0) or 0,
+        'SleepScore': d.get('sleepScore', 0) or 0,
+        'BodyBatteryMax': d.get('BodyBatteryMax', 0) or 0,
+        'BodyBatteryMin': d.get('BodyBatteryMin', 0) or 0
     }
 
-# 🚨 Generar alertas
-def generate_alerts(data_1d, data_14d):
+def generate_alerts(latest, baselines):
     alerts = []
-    if not data_1d or not data_14d:
-        return alerts
+    rhr = latest['RHR']
+    hrv = latest['HRV']
+    sleep = latest['SleepScore']
+    bb_max = latest['BodyBatteryMax']
+    bb_min = latest['BodyBatteryMin']
 
-    latest = data_1d[-1]
-    latest_hrv = latest.get('hrv', 0) or 0
-    latest_rhr = latest.get('restingHR', 0) or 0
+    if rhr >= 50 and rhr > baselines['RHR_7d'] + 5:
+        alerts.append(f"⚠️ RHR {rhr} bpm (+5 sobre basal {baselines['RHR_7d']})")
 
-    valid_hrv = [d.get('hrv') for d in data_14d if d.get('hrv') is not None]
-    valid_rhr = [d.get('restingHR') for d in data_14d if d.get('restingHR') is not None]
+    hrv_drop = (baselines['HRV_7d'] - hrv) / baselines['HRV_7d'] * 100
+    if hrv_drop >= 15:
+        alerts.append(f"⚠️ HRV {hrv} ms (-{hrv_drop:.1f}% de basal {baselines['HRV_7d']})")
 
-    if valid_hrv:
-        hrv_avg = sum(valid_hrv) / len(valid_hrv)
-        if hrv_avg and latest_hrv:
-            drop = (hrv_avg - latest_hrv) / hrv_avg * 100
-            if drop > 15:
-                alerts.append(f"⚠️ HRV bajó {drop:.1f}% (Promedio 14d: {hrv_avg:.1f}, Hoy: {latest_hrv:.1f})")
+    if sleep <= 64 and sleep < baselines['Sleep_7d'] - 10:
+        alerts.append(f"⚠️ Sleep Score {sleep} (< basal {baselines['Sleep_7d']} - 10)")
 
-    if valid_rhr:
-        rhr_avg = sum(valid_rhr) / len(valid_rhr)
-        rise = latest_rhr - rhr_avg
-        if rise > 5:
-            alerts.append(f"⚠️ RHR subió {rise:.1f} bpm (Promedio 14d: {rhr_avg:.1f}, Hoy: {latest_rhr:.1f})")
+    if bb_max <= 70 and bb_max < baselines['BBMax_7d'] - 10:
+        alerts.append(f"⚠️ BB Max {bb_max} (< basal {baselines['BBMax_7d']} - 10)")
 
-    if latest_rhr > 50:
-        alerts.append(f"🚨 RHR {latest_rhr:.1f} bpm supera umbral de FA (>50 bpm)")
-    if latest_rhr > 90:
-        alerts.append(f"🚨 RHR {latest_rhr:.1f} bpm supera límite crítico FA (>90 bpm)")
+    if bb_min < 25:
+        alerts.append(f"⚠️ BB Min {bb_min} (< 25)")
 
     return alerts
 
-# 🧠 Main
-data_1d = fetch_wellness_data(oldest, newest)
-data_14d = fetch_wellness_data((today - timedelta(days=14)).strftime("%Y-%m-%d"), newest)
-metrics = process_data(data_1d)
+def calculate_baselines(data_7d, data_14d, data_60d):
+    def avg(metric, data):
+        values = [d.get(metric, 0) or 0 for d in data if d.get(metric) is not None]
+        return round(sum(values) / len(values)) if values else 0
 
-message = f"📊 *Datos de Wellness ({newest})*\n"
-if not metrics:
-    message += "No hay datos para este día."
+    return {
+        'RHR_7d': avg('restingHR', data_7d),
+        'HRV_7d': avg('hrv', data_7d),
+        'Sleep_7d': avg('sleepScore', data_7d),
+        'BBMax_7d': avg('BodyBatteryMax', data_7d),
+        'BBMin_7d': avg('BodyBatteryMin', data_7d)
+    }
+
+# Main
+today = datetime(2025, 5, 4)
+newest = today.strftime("%Y-%m-%d")  # 2025-05-04
+oldest = newest
+
+data_1d = fetch_wellness_data(oldest, newest)
+data_7d = fetch_wellness_data((today - timedelta(days=7)).strftime("%Y-%m-%d"), newest)
+data_14d = fetch_wellness_data((today - timedelta(days=14)).strftime("%Y-%m-%d"), newest)
+data_60d = fetch_wellness_data((today - timedelta(days=60)).strftime("%Y-%m-%d"), newest)
+
+latest = process_data(data_1d)
+baselines = calculate_baselines(data_7d, data_14d, data_60d)
+
+message = f"📊 *Wellness ({newest})*\n"
+if not latest:
+    message += "No hay datos."
+    print("❌ Sin datos en Intervals.icu para el 4-5-2025")
 else:
     message += (
-        f"Body Battery - Máx: {metrics['BodyBatteryMax']}, Mín: {metrics['BodyBatteryMin']}\n"
-        f"RHR: {metrics['RHR']} bpm\n"
-        f"HRV: {metrics['HRV']} ms\n"
-        f"Sleep Score: {metrics['SleepScore']}\n"
+        f"RHR: {latest['RHR']} bpm\n"
+        f"HRV: {latest['HRV']} ms\n"
+        f"Sleep: {latest['SleepScore']}\n"
+        f"BB Max: {latest['BodyBatteryMax']}\n"
+        f"BB Min: {latest['BodyBatteryMin']}\n"
     )
+    print("✅ Datos procesados para el 4-5-2025")
 
-alerts = generate_alerts(data_1d, data_14d)
+alerts = generate_alerts(latest, baselines) if latest else []
 if alerts:
     message += "\n*Alertas:*\n" + "\n".join(alerts)
+    print("🚨 Alertas generadas")
 else:
-    message += "\n✅ *No hay alertas*"
+    message += "\n✅ *Sin alertas*"
+    print("✅ Sin alertas")
 
-# 📬 Enviar mensaje final
 send_telegram_message(message)
