@@ -79,8 +79,8 @@ def calculate_baselines(data_7d, data_14d, data_60d):
     }
 
 # Main
-today = datetime(2025, 5, 4)
-newest = today.strftime("%Y-%m-%d")  # 2025-05-04
+today = datetime.now()
+newest = today.strftime("%Y-%m-%d")
 oldest = newest
 
 data_1d = fetch_wellness_data(oldest, newest)
@@ -94,7 +94,7 @@ baselines = calculate_baselines(data_7d, data_14d, data_60d)
 message = f"📊 *Wellness ({newest})*\n"
 if not latest:
     message += "No hay datos."
-    print("❌ Sin datos en Intervals.icu para el 4-5-2025")
+    print(f"❌ Sin datos en Intervals.icu para {newest}")
 else:
     message += (
         f"RHR: {latest['RHR']} bpm\n"
@@ -103,7 +103,7 @@ else:
         f"BB Max: {latest['BodyBatteryMax']}\n"
         f"BB Min: {latest['BodyBatteryMin']}\n"
     )
-    print("✅ Datos procesados para el 4-5-2025")
+    print(f"✅ Datos procesados para {newest}")
 
 alerts = generate_alerts(latest, baselines) if latest else []
 if alerts:
