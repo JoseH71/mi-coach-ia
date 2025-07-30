@@ -1,0 +1,42 @@
+/* style.css */
+
+/* Hace más grande el número principal en las métricas (st.metric) */
+[data-testid="stMetricValue"] {
+    font-size: 2.5rem;
+    font-weight: 700;
+}
+
+/* Estilo para el "Vistazo Rápido" para que parezcan tarjetas */
+.card {
+    background-color: #1C1E26; /* Color de fondo secundario de tu tema */
+    border-radius: 10px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+    border: 1px solid #00aaff22; /* Borde sutil con el color primario */
+    text-align: center;
+}
+
+/* Estilo para el título del desplegable (st.expander) */
+[data-testid="stExpander"] summary {
+    font-size: 1.1rem;
+    font-weight: bold;
+    color: #00aaff; /* Color primario de tu tema */
+}
+
+/* Estilo para el medidor de readiness, para que sea más limpio */
+.gauge-container {
+    background-color: #1C1E26; /* Fondo de la barra */
+    border-radius: 5px;
+    padding: 3px;
+    border: 1px solid #00aaff22;
+}
+
+.gauge-fill {
+    height: 24px;
+    border-radius: 3px;
+    text-align: center;
+    color: #0E1117; /* Texto oscuro para que contraste con los colores vivos */
+    font-weight: bold;
+    line-height: 24px;
+    font-size: 1rem;
+}
