@@ -3,10 +3,12 @@ import requests
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
-    page_title="Coach IA de Readiness v3.3",
+    page_title="Coach IA de Readiness v3.5",
     page_icon="🧠",
     layout="wide"
 )
@@ -65,6 +67,14 @@ except (FileNotFoundError, KeyError):
     API_KEY = "27i9azt55smmhvg1ogc5gmn7x"
 
 # --- LÓGICA DE DATOS Y FUNCIONES HELPER ---
+
+# --- VARIABLE AÑADIDA PARA CORREGIR EL ERROR ---
+baseline_types = {
+    'recovery': 'Recuperación (Días de baja fatiga)',
+    'chronic': 'Crónico (Últimos 28 días)',
+    'historic': 'Histórico (Últimos 60 días)'
+}
+
 def get_score_interpretation(score):
     if score is None or pd.isna(score):
         return {"label": "N/A", "emoji": "❓", "color": "#a0a0a0", "description": "Datos no disponibles."}
@@ -189,6 +199,7 @@ def _score_sleep(df_including_today, sleep_score_hoy):
                 elif sleep_ma7 >= sleep_ma28 * 0.9: points = 7
                 score += points; breakdown.append(f"P. Sueño (MA7 vs MA28) -> {points} ptos.")
     return score, breakdown
+
 def _score_rhr(df_including_today, rhr_hoy, baselines):
     score, breakdown = 0, []
     rhr_baseline_rec = baselines.get('recovery', pd.Series()).get('restingHR')
@@ -200,6 +211,7 @@ def _score_rhr(df_including_today, rhr_hoy, baselines):
         elif rhr_deviation <= 3: points = 15
         score += points; breakdown.append(f"FC Reposo (vs rec) -> {points} ptos.")
     return score, breakdown
+
 def _score_hrv(df_including_today, hrv_hoy, historic_baseline_df):
     score, breakdown = 0, []
     hrv_data_7d = df_including_today['hrv'].tail(7)
@@ -214,9 +226,10 @@ def _score_hrv(df_including_today, hrv_hoy, historic_baseline_df):
             score += points; breakdown.append(f"VFC (HRV Z-Score): {z_score:.2f} -> {points} ptos.")
     return score, breakdown
 
-def get_readiness_analysis(selected_date, manual_context, df):
+def get_readiness_analysis(selected_date, df):
     if df.empty or pd.to_datetime(selected_date).strftime('%Y-%m-%d') not in df.index:
         return {"error": f"No hay datos de bienestar para el día {selected_date.strftime('%d-%m-%Y')}"}
+    
     today_data, df_including_today = df.loc[selected_date.strftime('%Y-%m-%d')], df[df.index <= pd.to_datetime(selected_date)]
     hrv_hoy, rhr_hoy, sleep_score_hoy = today_data.get('hrv'), today_data.get('restingHR'), today_data.get('sleepScore')
     yesterday_str, ctl_ayer, atl_ayer, tsb_ayer = (selected_date - timedelta(days=1)).strftime('%Y-%m-%d'), None, None, None
@@ -227,9 +240,6 @@ def get_readiness_analysis(selected_date, manual_context, df):
     
     ier_recov_score = calc_IER_v4_personal(rhr_today=rhr_hoy, tsb=tsb_ayer, df_history=df_including_today)
     
-    interp = get_score_interpretation(ier_recov_score)
-    verdict_text = f"{interp['emoji']} {interp['label'].upper()}: {interp['description']}"
-    
     past_df = df_including_today.iloc[:-1]
     R, breakdown = 50, []
     if not past_df.empty:
@@ -238,147 +248,247 @@ def get_readiness_analysis(selected_date, manual_context, df):
         score_s, s_brk = _score_sleep(df_including_today, sleep_score_hoy)
         score_r, r_brk = _score_rhr(df_including_today, rhr_hoy, baselines)
         score_h, h_brk = _score_hrv(df_including_today, hrv_hoy, historic_baseline_df)
-        # --- LÍNEA CORREGIDA ---
         R = max(0, min(100, int(score_s + score_r + score_h)))
         breakdown = s_brk + r_brk + h_brk
-
+    
+    verdict_text = "ERROR: No se pudo generar el veredicto" # Fallback
+    if ier_recov_score < 40 or R < 50:
+        verdict_text = "🔴 LUZ ROJA: Descanso o regenerativo."
+    elif ier_recov_score >= 70 and R >= 70:
+        verdict_text = "🟢 LUZ VERDE: Entreno normal o calidad."
+    elif ier_recov_score >= 70 and R < 70:
+        verdict_text = "🟡 LUZ AMARILLA: IER bueno pero Readiness bajo. Priorizar Z2."
+    else: 
+        verdict_text = "🟡 LUZ AMARILLA: Rodaje moderado, evita sesiones duras."
+        
     return {
         "verdict": verdict_text, "readiness_score": R, "ier_recov_score": ier_recov_score,
         "metrics": {"VFC (HRV)": hrv_hoy, "FC Reposo": rhr_hoy, "Puntuación Sueño": sleep_score_hoy},
         "load_metrics": {"ctl": ctl_ayer, "atl": atl_ayer, "tsb": tsb_ayer},
-        "breakdown": breakdown, "manual_context": manual_context
+        "breakdown": breakdown
     }
+
+def generate_range_analysis(fecha_inicio, fecha_fin):
+    extended_start = fecha_inicio - timedelta(days=90)
+    df_wellness = get_wellness_data(extended_start, fecha_fin)
+    
+    if df_wellness.empty:
+        return {"error": "No se encontraron datos de bienestar para el rango especificado"}
+    
+    range_start, range_end = pd.to_datetime(fecha_inicio), pd.to_datetime(fecha_fin)
+    range_wellness = df_wellness[(df_wellness.index >= range_start) & (df_wellness.index <= range_end)]
+    
+    if range_wellness.empty:
+        return {"error": "No hay datos de bienestar en el rango seleccionado"}
+        
+    daily_analysis = []
+    for date in range_wellness.index:
+        try:
+            analysis = get_readiness_analysis(date.date(), df_wellness)
+            if "error" not in analysis:
+                daily_analysis.append({
+                    'date': date, 'ier_score': analysis.get('ier_recov_score'), 'readiness_score': analysis.get('readiness_score'),
+                    'hrv': analysis.get('metrics', {}).get('VFC (HRV)'), 'rhr': analysis.get('metrics', {}).get('FC Reposo'),
+                    'sleep_score': analysis.get('metrics', {}).get('Puntuación Sueño'), 'ctl': analysis.get('load_metrics', {}).get('ctl'),
+                    'atl': analysis.get('load_metrics', {}).get('atl'), 'tsb': analysis.get('load_metrics', {}).get('tsb')
+                })
+        except Exception:
+            continue
+    
+    if not daily_analysis:
+        return {"error": "No se pudieron procesar los análisis diarios"}
+        
+    df_analysis = pd.DataFrame(daily_analysis)
+    
+    stats = {
+        'total_days': len(df_analysis), 'avg_ier': df_analysis['ier_score'].mean(),
+        'avg_readiness': df_analysis['readiness_score'].mean(),
+        'avg_hrv': df_analysis['hrv'].dropna().mean() if not df_analysis['hrv'].dropna().empty else 0,
+        'avg_rhr': df_analysis['rhr'].dropna().mean() if not df_analysis['rhr'].dropna().empty else 0,
+        'avg_sleep': df_analysis['sleep_score'].dropna().mean() if not df_analysis['sleep_score'].dropna().empty else 0,
+        'avg_tsb': df_analysis['tsb'].dropna().mean() if not df_analysis['tsb'].dropna().empty else None
+    }
+    
+    distribution = {
+        'excelente': len(df_analysis[df_analysis['ier_score'] >= 85]), 'bueno': len(df_analysis[(df_analysis['ier_score'] >= 70) & (df_analysis['ier_score'] < 85)]),
+        'medio': len(df_analysis[(df_analysis['ier_score'] >= 50) & (df_analysis['ier_score'] < 70)]),
+        'bajo': len(df_analysis[(df_analysis['ier_score'] >= 40) & (df_analysis['ier_score'] < 50)]),
+        'muy_bajo': len(df_analysis[df_analysis['ier_score'] < 40])
+    }
+    
+    first_week, last_week = df_analysis.head(7)['ier_score'].mean(), df_analysis.tail(7)['ier_score'].mean()
+    trend = "Mejorando" if last_week > first_week + 2 else "Empeorando" if last_week < first_week - 2 else "Estable"
+    
+    problem_days = df_analysis[df_analysis['ier_score'] < 50]
+    
+    return {
+        'df_analysis': df_analysis, 'stats': stats, 'distribution': distribution,
+        'trend': trend, 'problem_days': problem_days
+    }
+
+def create_range_charts(analysis_result):
+    df_analysis = analysis_result['df_analysis']
+    charts = {}
+    fig_timeline = go.Figure()
+    fig_timeline.add_trace(go.Scatter(x=df_analysis['date'], y=df_analysis['ier_score'], mode='lines+markers', name='IER Score', line=dict(color='#00aaff', width=3), marker=dict(size=6)))
+    fig_timeline.add_trace(go.Scatter(x=df_analysis['date'], y=df_analysis['readiness_score'], mode='lines+markers', name='Readiness Score', line=dict(color='#ff6b6b', width=2), marker=dict(size=4)))
+    fig_timeline.add_hline(y=70, line_dash="dash", line_color="green", annotation_text="Bueno")
+    fig_timeline.add_hline(y=50, line_dash="dash", line_color="orange", annotation_text="Medio")
+    fig_timeline.update_layout(title='Evolución de Scores de Recuperación', xaxis_title='Fecha', yaxis_title='Score', height=500, yaxis=dict(range=[0, 100]))
+    charts['timeline'] = fig_timeline
+    
+    distribution = analysis_result['distribution']
+    labels = ['Excelente (85+)', 'Bueno (70-84)', 'Medio (50-69)', 'Bajo (40-49)', 'Muy Bajo (<40)']
+    values = [distribution['excelente'], distribution['bueno'], distribution['medio'], distribution['bajo'], distribution['muy_bajo']]
+    colors = ['#00FF7F', '#5cb85c', '#f0ad4e', '#E59434', '#d9534f']
+    fig_dist = go.Figure(data=go.Pie(labels=labels, values=values, hole=0.4, marker_colors=colors))
+    fig_dist.update_layout(title='Distribución de Estados de IER', height=500)
+    charts['distribution'] = fig_dist
+    
+    if not df_analysis['hrv'].dropna().empty and not df_analysis['rhr'].dropna().empty:
+        fig_corr = go.Figure()
+        fig_corr.add_trace(go.Scatter(x=df_analysis['hrv'], y=df_analysis['rhr'], mode='markers', marker=dict(size=8, color=df_analysis['ier_score'], colorscale='RdYlGn', showscale=True, colorbar=dict(title="IER Score")), text=df_analysis['date'].dt.strftime('%d/%m'), hovertemplate='<b>%{text}</b><br>HRV: %{x}<br>RHR: %{y}<extra></extra>'))
+        fig_corr.update_layout(title='Relación HRV vs FC Reposo', xaxis_title='HRV (ms)', yaxis_title='FC Reposo (bpm)', height=500)
+        charts['correlation'] = fig_corr
+    return charts
+
+def create_visual_metrics_table(df_analysis):
+    table_data = []
+    dias_es = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles', 'Thursday': 'Jueves', 'Friday': 'Viernes', 'Saturday': 'Sábado', 'Sunday': 'Domingo'}
+    for _, row in df_analysis.iterrows():
+        interp = get_score_interpretation(row['ier_score'])
+        dia_semana = dias_es.get(row['date'].strftime('%A'), row['date'].strftime('%A'))
+        table_data.append({
+            'Fecha': row['date'].strftime('%d/%m/%Y'), 'Día': dia_semana, 'Estado': f"{interp['emoji']} {interp['label']}",
+            'IER': f"{row['ier_score']:.1f}", 'Readiness': f"{row['readiness_score']:.0f}",
+            'HRV': f"{row['hrv']:.1f}" if pd.notna(row['hrv']) else "N/A",
+            'FC Reposo': f"{row['rhr']:.0f}" if pd.notna(row['rhr']) else "N/A",
+            'Sueño': f"{row['sleep_score']:.0f}" if pd.notna(row['sleep_score']) else "N/A",
+            'TSB': f"{row['tsb']:.1f}" if pd.notna(row['tsb']) else "N/A"
+        })
+    return pd.DataFrame(table_data)
 
 def display_comparative_dashboard(readiness_score, ier_score, prev_readiness_score, prev_ier_score, df_history, selected_date):
     readiness_interp, ier_interp = get_score_interpretation(readiness_score), get_score_interpretation(ier_score)
     readiness_trend, ier_trend = get_trend_arrow(readiness_score, prev_readiness_score), get_trend_arrow(ier_score, prev_ier_score)
+    
     ier_7d_scores = []
     for i in range(6, -1, -1):
         day = selected_date - timedelta(days=i)
         if day.strftime('%Y-%m-%d') in df_history.index:
-            df_slice = df_history[df_history.index <= day.strftime('%Y-%m-%d')]
+            df_slice = df_history[df_history.index <= pd.to_datetime(day)]
             if len(df_slice) >= 21:
                 day_data = df_slice.loc[day.strftime('%Y-%m-%d')]
-                rhr_val, tsb_val = day_data.get('restingHR'), day_data.get('tsb')
-                if pd.isna(tsb_val):
-                    ctl_val, atl_val = day_data.get('ctl', 0), day_data.get('atl', 0)
-                    tsb_val = ctl_val - atl_val if pd.notna(ctl_val) and pd.notna(atl_val) else None
+                rhr_val = day_data.get('restingHR')
+                ctl_val, atl_val = day_data.get('ctl', 0), day_data.get('atl', 0)
+                tsb_val = ctl_val - atl_val if pd.notna(ctl_val) and pd.notna(atl_val) else None
                 ier_7d_scores.append(calc_IER_v4_personal(rhr_val, tsb_val, df_slice))
+    
     sparkline_svg = generate_sparkline(ier_7d_scores)
+    
     dashboard_html = f"""<div class="dashboard-container"><div class="row">
-            <div class="col-md-7 dashboard-col" style="border-right: 1px solid {final_border_color}; padding-right: 20px;">
-                <h3>Tu Recuperación (IER)</h3>{sparkline_svg}
-                <div class="tooltip-container">
-                    <span class="score" style="color: {ier_interp['color']};">{ier_score}</span>
-                    <p style="font-size: 1.1em; margin-top: 5px; font-weight: bold;">{ier_interp['emoji']} {ier_interp['label']} {ier_trend}</p>
-                    <span class="tooltip-text">{ier_interp['description']}</span></div></div>
-            <div class="col-md-5 dashboard-col" style="padding-left: 20px;"><h3 style="font-size: 1.0em; color: #a0a0a0;">Readiness Global</h3>
-                 <div class="tooltip-container" style="margin-top: 38px;">
-                    <span class="score-secondary" style="color: {readiness_interp['color']};">{readiness_score}</span>
-                    <p style="font-size: 1.0em; margin-top: 5px; font-weight: bold;">{readiness_interp['emoji']} {readiness_interp['label']} {readiness_trend}</p>
-                    <span class="tooltip-text">{readiness_interp['description']}</span></div></div></div></div>"""
+        <div class="col-md-7 dashboard-col" style="border-right: 1px solid {final_border_color}; padding-right: 20px;">
+            <h3>Tu Recuperación (IER)</h3>{sparkline_svg}
+            <div class="tooltip-container">
+                <span class="score" style="color: {ier_interp['color']};">{ier_score:.1f}</span>
+                <p style="font-size: 1.1em; margin-top: 5px; font-weight: bold;">{ier_interp['emoji']} {ier_interp['label']} {ier_trend}</p>
+                <span class="tooltip-text">{ier_interp['description']}</span></div></div>
+        <div class="col-md-5 dashboard-col" style="padding-left: 20px;"><h3 style="font-size: 1.0em; color: #a0a0a0;">Readiness Global</h3>
+               <div class="tooltip-container" style="margin-top: 38px;">
+                <span class="score-secondary" style="color: {readiness_interp['color']};">{readiness_score}</span>
+                <p style="font-size: 1.0em; margin-top: 5px; font-weight: bold;">{readiness_interp['emoji']} {readiness_interp['label']} {readiness_trend}</p>
+                <span class="tooltip-text">{readiness_interp['description']}</span></div></div></div></div>"""
     st.markdown(dashboard_html, unsafe_allow_html=True)
 
 def generate_coaching_summary(analysis):
-    ier_score = analysis.get('ier_recov_score')
-    interp = get_score_interpretation(ier_score)
     verdict = analysis.get('verdict', '')
-    if pd.notna(ier_score):
-        estado = f"{interp['emoji']} {verdict.split(':')[0]}"
-        plan = interp['description']
-        if ier_score >= 85: patron = "✅ Oportunidad Clara: Tu tendencia de recuperación es excelente. Luz verde para el máximo estímulo."
-        elif ier_score >= 70: patron = "✅ Base Sólida: Vienes recuperando bien y el sistema está listo para asimilar carga."
-        elif ier_score >= 50: patron = "🟡 Adaptación en Proceso: El cuerpo está asimilando la carga. No es día para forzar, sino para consolidar."
-        elif ier_score >= 40: patron = "🟠 Señal de Carga: La fatiga acumulada es notable. Es crucial bajar la intensidad."
-        else: patron = "🔴 Fatiga Elevada: El sistema nervioso pide una tregua."
-    else: estado, patron, plan = "N/A", "N/A", "N/A"
+    
+    patron, plan = "N/A", "N/A"
+    if "VERDE" in verdict:
+        patron = "✅ Combinación Óptima: Tanto tu tendencia (IER) como tu estado de hoy (Readiness) son buenos."
+        plan = "Luz verde total. Día ideal para sesiones de calidad (SST, Umbral)."
+    elif "IER bueno pero Readiness bajo" in verdict:
+        patron = "🟡 Conflicto de Señales: Tu tendencia (IER) es buena, pero tu estado de hoy (Readiness) es bajo. Priorizamos seguridad."
+        plan = "Rodaje suave en Z2 o descanso activo."
+    elif "Rodaje moderado" in verdict:
+        patron = "🟡 Precaución: El sistema muestra señales mixtas. No es día para forzar, sino para consolidar."
+        plan = "Mantén un volumen moderado en Z2/Z3. Evita sesiones de alta intensidad."
+    elif "ROJA" in verdict:
+        patron = "🔴 Fatiga Elevada: El sistema nervioso y fisiológico pide una tregua."
+        plan = "Descanso total o un paseo muy suave (Z1)."
+    
     hrv_hoy, rhr_hoy = analysis.get('metrics', {}).get('VFC (HRV)'), analysis.get('metrics', {}).get('FC Reposo')
     hrv_text = f"{hrv_hoy:.1f} ms" if pd.notna(hrv_hoy) else "N/A"
     rhr_text = f"{rhr_hoy:.0f} bpm" if pd.notna(rhr_hoy) else "N/A"
-    return f"**Estado:** {estado}\n**HRV/RHR Hoy:** {hrv_text} / {rhr_text}\n**Patrón:** {patron}\n**Plan del Día:** {plan}"
+    
+    return f"**Veredicto:** {verdict}\n**HRV/RHR Hoy:** {hrv_text} / {rhr_text}\n**Patrón:** {patron}\n**Plan del Día:** {plan}"
 
 def quick_decision_visual(verdict):
     st.markdown(f"<h4>{verdict}</h4>", unsafe_allow_html=True)
 
-def validate_buchheit(df):
-    if 'trimp' not in df.columns or df['trimp'].isna().sum() > len(df) * 0.5: return "N/A (Faltan datos de TRIMP)"
-    df['hrv_7d'] = df['hrv'].rolling(window=7, min_periods=5).mean()
-    df['trimp_7d'] = df['trimp'].rolling(window=7, min_periods=5).mean()
-    df['hrv_trend'] = df['hrv_7d'].diff()
-    df['trimp_trend'] = df['trimp_7d'].diff()
-    concordant_days = df[((df['hrv_trend'] >= 0) & (df['trimp_trend'] <= 0)) | ((df['hrv_trend'] <= 0) & (df['trimp_trend'] >= 0))]
-    total_valid_days = df.dropna(subset=['hrv_trend', 'trimp_trend'])
-    if len(total_valid_days) == 0: return "N/A"
-    concordance = (len(concordant_days) / len(total_valid_days)) * 100
-    return f"{concordance:.1f}%"
-def validate_banister(df_val):
-    if 'tsb' not in df_val.columns or 'readiness_score' not in df_val.columns: return "N/A"
-    df_filtered = df_val[['tsb', 'readiness_score']].dropna()
-    if len(df_filtered) < 3: return "N/A (datos insuf.)"
-    correlation = df_filtered['tsb'].corr(df_filtered['readiness_score'])
-    if pd.isna(correlation): return "N/A"
-    return f"r = {correlation:.2f}"
-
 # --- INTERFAZ PRINCIPAL ---
-st.title("🧠 Coach IA de Readiness v3.3")
-selected_date = st.date_input("Selecciona la fecha de análisis:", datetime.now().date())
-context_options = st.multiselect("Contexto del Día (Opcional):", ["Calor Extremo", "Estrés Laboral/Personal", "Viaje", "Alcohol", "Mala Nutrición", "Enfermedad Leve", "Vacaciones", "Buen Descanso Extra"])
-baseline_types = {'recovery': 'De Recuperación', 'chronic': 'Crónica (28d)', 'historic': 'Histórica (60d)'}
+st.title("🧠 Coach IA de Readiness v3.5")
+selected_date = st.date_input("Selecciona la fecha de análisis:", datetime.now().date(), max_value=datetime.now().date())
+df_full = get_wellness_data(selected_date - timedelta(days=90), selected_date)
 
-if selected_date:
-    df_full = get_wellness_data(selected_date - timedelta(days=90), selected_date)
-    analysis = get_readiness_analysis(selected_date, context_options, df_full)
-    tabs = ["📊 Readiness Diario", "❤️ Líneas Basales", "🗓️ Resumen por Rango", "🔬 Validación del Modelo"]
-    tab1, tab2, tab3, tab4 = st.tabs(tabs)
+if df_full.empty:
+    st.warning("No se han podido cargar los datos de bienestar. Revisa la conexión o el rango de fechas.")
+else:
+    analysis = get_readiness_analysis(selected_date, df_full)
+
     if "error" in analysis:
         st.error(analysis["error"])
     else:
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Readiness Diario", "❤️ Líneas Basales", "🗓️ Resumen por Rango", "🔬 Validación del Modelo"])
+        
         with tab1:
             st.subheader("🚦 Veredicto Rápido del Día")
             quick_decision_visual(analysis.get('verdict', ''))
+            
             load = analysis.get("load_metrics", {})
             ctl, atl, tsb = load.get('ctl'), load.get('atl'), load.get('tsb')
-            st.markdown('<div class="card-grid">', unsafe_allow_html=True)
             g_col1, g_col2, g_col3 = st.columns(3)
             with g_col1: st.metric(label="Forma (CTL) Ayer", value=f"{ctl:.1f}" if pd.notna(ctl) else "N/A")
             with g_col2: st.metric(label="Fatiga (ATL) Ayer", value=f"{atl:.1f}" if pd.notna(atl) else "N/A")
             with g_col3: st.metric(label="Frescura (TSB) Ayer", value=f"{tsb:.1f}" if pd.notna(tsb) else "N/A")
-            st.markdown('</div>', unsafe_allow_html=True)
-            st.markdown("---")
+            
             st.subheader("📊 Dashboard Comparativo del Día")
-            if analysis.get("manual_context"):
-                st.warning(f"**Contexto Manual Aplicado:** {', '.join(analysis['manual_context'])}.")
+
             prev_readiness_score, prev_ier_score = None, None
             prev_date = selected_date - timedelta(days=1)
-            if pd.to_datetime(prev_date).strftime('%Y-%m-%d') in df_full.index:
-                prev_analysis_data = get_readiness_analysis(prev_date, [], df_full)
+            if prev_date.strftime('%Y-%m-%d') in df_full.index:
+                prev_analysis_data = get_readiness_analysis(prev_date, df_full)
                 if "error" not in prev_analysis_data:
-                    prev_readiness_score, prev_ier_score = prev_analysis_data.get('readiness_score'), prev_analysis_data.get('ier_recov_score')
+                    prev_readiness_score = prev_analysis_data.get('readiness_score')
+                    prev_ier_score = prev_analysis_data.get('ier_recov_score')
+            
             display_comparative_dashboard(analysis.get('readiness_score'), analysis.get('ier_recov_score'), prev_readiness_score, prev_ier_score, df_full, selected_date)
+            
             st.markdown(f"""<div class="card">
                 <h5 style="margin-bottom: 10px; color: {st.session_state.primary_color};">📌 Leyenda de Interpretación</h5>
                 <p style="font-size: 0.9em; margin-top: -5px; margin-bottom: 10px; color: #a0a0a0;">
-                    <em><b>IER:</b> Tu tendencia de recuperación (Métrica Principal). | <b>Readiness:</b> Tu estado global del día (Métrica Secundaria).</em></p>
+                    <em><b>IER:</b> Tu tendencia de recuperación (Métrica Principal). | <b>Readiness:</b> Tu estado del día (Métrica Secundaria).</em></p>
                 <ul style="list-style-type: none; padding-left: 0; margin-bottom: 0;">
                 <li style="margin-bottom: 5px;">🔴 <strong>0–39 → Muy bajo:</strong> Descanso / Z1 suave.</li>
                 <li style="margin-bottom: 5px;">🟠 <strong>40–49 → Bajo:</strong> Rodaje ligero, evitar calidad.</li>
                 <li style="margin-bottom: 5px;">🟡 <strong>50–69 → Medio:</strong> Entreno adaptado: ideal para Z2/Z3 y técnica, evitar picos.</li>
                 <li style="margin-bottom: 5px;">🟢 <strong>70–84 → Bueno:</strong> Entreno normal.</li>
                 <li>🟢✨ <strong>85–100 → Excelente:</strong> Entreno clave / SST largo.</li></ul></div>""", unsafe_allow_html=True)
+            
             with st.expander("⚡️ Coaching Rápido IA (Análisis para José)"):
                 coaching_summary_text = generate_coaching_summary(analysis)
                 st.markdown(coaching_summary_text)
-                st.info("Copia y pega este resumen para tu entrenador.")
-            st.markdown("---")
-            st.subheader("📈 Métricas Clave y Vistazo Rápido")
+
+            st.subheader("📈 Métricas Clave y Desglose")
             m_col1, m_col2, m_col3 = st.columns(3)
             metrics = analysis.get('metrics', {})
-            hrv, rhr, sleep = metrics.get('VFC (HRV)'), metrics.get('FC Reposo'), metrics.get('Puntuación Sueño')
-            with m_col1: st.metric("VFC (HRV)", f"{hrv:.1f} ms" if pd.notna(hrv) else "N/A")
-            with m_col2: st.metric("FC Reposo", f"{rhr:.0f} bpm" if pd.notna(rhr) else "N/A")
-            with m_col3: st.metric("Puntuación Sueño", f"{sleep:.0f}" if pd.notna(sleep) else "N/A")
+            with m_col1: st.metric("VFC (HRV)", f"{metrics.get('VFC (HRV)', 0):.1f} ms" if pd.notna(metrics.get('VFC (HRV)')) else "N/A")
+            with m_col2: st.metric("FC Reposo", f"{metrics.get('FC Reposo', 0):.0f} bpm" if pd.notna(metrics.get('FC Reposo')) else "N/A")
+            with m_col3: st.metric("Puntuación Sueño", f"{metrics.get('Puntuación Sueño', 0):.0f}" if pd.notna(metrics.get('Puntuación Sueño')) else "N/A")
+            
             with st.expander("Ver desglose del Readiness (Score Secundario)"):
                 st.markdown("\n".join(f"- {item}" for item in analysis.get('breakdown', [])))
+
             with st.expander("📋 Resumen para Copiar al Coach"):
                 load, metrics = analysis.get('load_metrics', {}), analysis.get('metrics', {})
                 ctl, atl, tsb = load.get('ctl'), load.get('atl'), load.get('tsb')
@@ -389,7 +499,7 @@ if selected_date:
                 resumen_texto = f"**Resumen de Salud para el {selected_date.strftime('%d/%m/%Y')}**\n\n"
                 resumen_texto += f"**Carga (Ayer):** CTL: {f'{ctl:.1f}' if pd.notna(ctl) else 'N/A'}, ATL: {f'{atl:.1f}' if pd.notna(atl) else 'N/A'}, TSB: {f'{tsb:.1f}' if pd.notna(tsb) else 'N/A'}\n---\n"
                 resumen_texto += f"**Veredicto:** {analysis.get('verdict', 'N/A')}\n"
-                resumen_texto += f"**IER (Score Principal):** {analysis.get('ier_recov_score', 'N/A')} / 100\n"
+                resumen_texto += f"**IER (Score Principal):** {analysis.get('ier_recov_score', 'N/A'):.1f} / 100\n"
                 resumen_texto += f"**Readiness (Score Secundario):** {analysis.get('readiness_score', 'N/A')} / 100\n---\n"
                 resumen_texto += f"**Métricas Clave:** HRV: {hrv_text} ms | RHR: {rhr_text} bpm | Sueño: {sleep_text}\n\n---\n**Líneas Basales:**\n"
                 baselines = calculate_baselines(df_full[df_full.index < pd.to_datetime(selected_date)])
@@ -397,51 +507,96 @@ if selected_date:
                     rhr_base, hrv_base, atl_base = baselines.get(key, {}).get('restingHR'), baselines.get(key, {}).get('hrv'), baselines.get(key, {}).get('atl')
                     resumen_texto += f"- **{name}:** RHR: {f'{rhr_base:.1f}' if pd.notna(rhr_base) else 'N/A'}, HRV: {f'{hrv_base:.1f}' if pd.notna(hrv_base) else 'N/A'}, ATL: {f'{atl_base:.1f}' if pd.notna(atl_base) else 'N/A'}\n"
                 st.code(resumen_texto, language='markdown')
-        
+
+        # --- CÓDIGO RESTAURADO Y FUNCIONAL ---
         with tab2:
             st.header("❤️ Tus Líneas Basales de Referencia")
-            baselines = calculate_baselines(df_full[df_full.index < pd.to_datetime(selected_date)])
-            b_col1, b_col2, b_col3 = st.columns(3)
-            for col, (key, name) in zip([b_col1, b_col2, b_col3], baseline_types.items()):
-                with col:
-                    st.subheader(name)
-                    rhr_base, hrv_base, atl_base = baselines.get(key, {}).get('restingHR'), baselines.get(key, {}).get('hrv'), baselines.get(key, {}).get('atl')
-                    st.metric("RHR", f"{rhr_base:.1f}" if pd.notna(rhr_base) else "N/A")
-                    st.metric("HRV", f"{hrv_base:.1f}" if pd.notna(hrv_base) else "N/A")
-                    st.metric("ATL", f"{atl_base:.1f}" if pd.notna(atl_base) else "N/A")
-
-        with tab3:
-            st.header("🗓️ Resumen de Métricas por Rango")
-            col_fecha1, col_fecha2 = st.columns(2)
-            with col_fecha1: fecha_inicio = st.date_input("Fecha de inicio:", value=(datetime.now() - timedelta(days=7)).date(), key="fecha_inicio_rango")
-            with col_fecha2: fecha_fin = st.date_input("Fecha de fin:", value=datetime.now().date(), key="fecha_fin_rango")
-            if fecha_inicio <= fecha_fin:
-                if st.button("🔄 Generar Resumen por Rango", type="primary"):
-                    st.warning("Esta función está siendo revisada para adaptarse a la nueva lógica.")
+            st.info("Estas son tus medias de referencia calculadas a partir de tu historial. Son clave para entender tus datos diarios en contexto.", icon="ℹ️")
+            
+            df_para_baselines = df_full[df_full.index < pd.to_datetime(selected_date)]
+            if len(df_para_baselines) < 7:
+                st.warning("Se necesitan al menos 7 días de historial para calcular las líneas basales.")
+            else:
+                baselines = calculate_baselines(df_para_baselines)
+                b_col1, b_col2, b_col3 = st.columns(3)
+                
+                # Usamos el diccionario baseline_types que hemos definido
+                for col, (key, name) in zip([b_col1, b_col2, b_col3], baseline_types.items()):
+                    with col:
+                        st.subheader(name)
+                        rhr_base = baselines.get(key, {}).get('restingHR')
+                        hrv_base = baselines.get(key, {}).get('hrv')
+                        atl_base = baselines.get(key, {}).get('atl')
+                        st.metric("FC Reposo Media", f"{rhr_base:.1f}" if pd.notna(rhr_base) else "N/A")
+                        st.metric("VFC (HRV) Media", f"{hrv_base:.1f}" if pd.notna(hrv_base) else "N/A")
+                        st.metric("Fatiga (ATL) Media", f"{atl_base:.1f}" if pd.notna(atl_base) else "N/A")
         
+        with tab3:
+            st.header("🗓️ Análisis por Rango de Fechas")
+            today = datetime.now().date()
+            col1, col2 = st.columns(2)
+            with col1:
+                fecha_inicio = st.date_input("Fecha de Inicio", today - timedelta(days=29))
+            with col2:
+                fecha_fin = st.date_input("Fecha de Fin", today)
+
+            if st.button("Analizar Rango"):
+                if fecha_inicio > fecha_fin:
+                    st.error("La fecha de inicio no puede ser posterior a la fecha de fin.")
+                else:
+                    with st.spinner("Generando análisis del rango..."):
+                        analysis_result = generate_range_analysis(fecha_inicio, fecha_fin)
+                        if "error" in analysis_result:
+                            st.error(analysis_result["error"])
+                        else:
+                            st.subheader("Resumen Estadístico del Periodo")
+                            stats = analysis_result['stats']
+                            s_col1, s_col2, s_col3 = st.columns(3)
+                            s_col1.metric("IER Score Medio", f"{stats['avg_ier']:.1f}")
+                            s_col2.metric("Readiness Medio", f"{stats['avg_readiness']:.1f}")
+                            s_col3.metric("Tendencia General", analysis_result['trend'])
+                            
+                            charts = create_range_charts(analysis_result)
+                            st.plotly_chart(charts['timeline'], use_container_width=True)
+                            
+                            c_col1, c_col2 = st.columns(2)
+                            with c_col1:
+                                st.plotly_chart(charts['distribution'], use_container_width=True)
+                            with c_col2:
+                                if 'correlation' in charts:
+                                    st.plotly_chart(charts['correlation'], use_container_width=True)
+                            
+                            st.subheader("Datos Detallados del Periodo")
+                            df_visual = create_visual_metrics_table(analysis_result['df_analysis'])
+                            st.dataframe(df_visual, use_container_width=True)
+
         with tab4:
-            st.header("🔬 Validación del Modelo")
-            st.info("Esta sección contrasta las predicciones de tu modelo con marcos científicos publicados.")
-            if st.button("🚀 Ejecutar Validación (últimos 60 días)", type="primary"):
-                with st.spinner("Ejecutando validaciones..."):
-                    validation_period = 60
-                    start_val_date, end_val_date = datetime.now().date() - timedelta(days=validation_period), datetime.now().date()
-                    df_val_wellness = get_wellness_data(start_val_date, end_val_date)
-                    df_val_activity = get_activity_data(start_val_date, end_val_date)
-                    df_val = df_val_wellness.join(df_val_activity)
-                    if 'ctl' in df_val.columns and 'atl' in df_val.columns: df_val['tsb'] = df_val['ctl'] - df_val['atl']
-                    else: df_val['tsb'] = np.nan
-                    readiness_scores = []
-                    for day in df_val.index:
-                        daily_analysis = get_readiness_analysis(day.date(), [], df_val)
-                        readiness_scores.append(daily_analysis.get('readiness_score'))
-                    df_val['readiness_score'] = readiness_scores
-                    buchheit_result, banister_result = validate_buchheit(df_val.copy()), validate_banister(df_val.copy())
-                    st.subheader("Resultados de la Validación")
-                    res_col1, res_col2 = st.columns(2)
-                    with res_col1:
-                        st.metric("TRIMP vs HRV (Buchheit)", buchheit_result)
-                        st.caption("Alineación Carga/Respuesta. >75%: Excelente ✅, 50-75%: Regular ⚠️, <50%: Pobre 🚫.")
-                    with res_col2:
-                        st.metric("Banister Performance Model (TSB vs Readiness)", banister_result)
-                        st.caption("Mide la correlación entre la frescura (TSB) y tu score de Readiness. Un valor r > 0.7 es fuerte.")
+            st.header("🔬 Validación del Modelo (IER vs Readiness)")
+            st.info("Esta pestaña compara la evolución de los dos scores para validar su comportamiento. El IER (azul) debe ser más estable y marcar tendencias, mientras que el Readiness (rojo) puede ser más volátil y reflejar el estado del día.", icon="ℹ️")
+
+            with st.spinner("Calculando datos históricos para validación..."):
+                df_hist_full = get_wellness_data(datetime.now().date() - timedelta(days=90), datetime.now().date())
+                
+                validation_data = []
+                for date in df_hist_full.index:
+                    try:
+                        analysis_day = get_readiness_analysis(date.date(), df_hist_full)
+                        if "error" not in analysis_day:
+                            validation_data.append({
+                                'Fecha': date,
+                                'IER Score': analysis_day.get('ier_recov_score'),
+                                'Readiness Score': analysis_day.get('readiness_score')
+                            })
+                    except Exception:
+                        continue
+                
+                df_validation = pd.DataFrame(validation_data).set_index('Fecha')
+                
+                fig_val = go.Figure()
+                fig_val.add_trace(go.Scatter(x=df_validation.index, y=df_validation['IER Score'], mode='lines', name='IER Score (Tendencia)', line=dict(color=st.session_state.primary_color, width=3)))
+                fig_val.add_trace(go.Scatter(x=df_validation.index, y=df_validation['Readiness Score'], mode='lines', name='Readiness Score (Diario)', line=dict(color='#ff6b6b', width=1.5)))
+                fig_val.update_layout(title='Comparativa Histórica de Scores', yaxis_title='Score', yaxis=dict(range=[0, 100]))
+                st.plotly_chart(fig_val, use_container_width=True)
+                
+                with st.expander("Ver datos tabulados"):
+                    st.dataframe(df_validation.style.format("{:.1f}"), use_container_width=True)
