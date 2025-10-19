@@ -8,7 +8,7 @@ import plotly.express as px
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
-    page_title="Coach IA de Readiness v3.5",
+    page_title="Coach IA de Readiness v3.6 - Híbrido",
     page_icon="🧠",
     layout="wide"
 )
@@ -226,6 +226,84 @@ def _score_hrv(df_including_today, hrv_hoy, historic_baseline_df):
             score += points; breakdown.append(f"VFC (HRV Z-Score): {z_score:.2f} -> {points} ptos.")
     return score, breakdown
 
+# --- NUEVA FUNCIÓN PARA BANDAS DE NORMALIDAD ---
+@st.cache_data(ttl=3600)
+def calculate_normality_bands(df_60d_history):
+    """
+    Calcula las bandas de normalidad (Media 60d ± 0.75 * SD) para HRV y RHR.
+    """
+    if df_60d_history.empty or len(df_60d_history) < 21: # Necesitamos suficientes datos
+        return {
+            'hrv_mean': None, 'hrv_std': None, 'hrv_upper': None, 'hrv_lower': None,
+            'rhr_mean': None, 'rhr_std': None, 'rhr_upper': None, 'rhr_lower': None
+        }
+
+    hrv_data = df_60d_history['hrv'].dropna()
+    rhr_data = df_60d_history['restingHR'].dropna()
+
+    bands = {}
+    
+    # Cálculos de HRV
+    if len(hrv_data) >= 21:
+        bands['hrv_mean'] = hrv_data.mean()
+        bands['hrv_std'] = hrv_data.std()
+        if pd.notna(bands['hrv_std']) and bands['hrv_std'] > 0:
+            bands['hrv_lower'] = bands['hrv_mean'] - (0.75 * bands['hrv_std'])
+            bands['hrv_upper'] = bands['hrv_mean'] + (0.75 * bands['hrv_std'])
+        else:
+            bands['hrv_lower'] = bands['hrv_mean'] * 0.9
+            bands['hrv_upper'] = bands['hrv_mean'] * 1.1
+    else:
+        bands.update({'hrv_mean': None, 'hrv_std': None, 'hrv_upper': None, 'hrv_lower': None})
+
+    # Cálculos de RHR
+    if len(rhr_data) >= 21:
+        bands['rhr_mean'] = rhr_data.mean()
+        bands['rhr_std'] = rhr_data.std()
+        if pd.notna(bands['rhr_std']) and bands['rhr_std'] > 0:
+            bands['rhr_lower'] = bands['rhr_mean'] - (0.75 * bands['rhr_std'])
+            bands['rhr_upper'] = bands['rhr_mean'] + (0.75 * bands['rhr_std'])
+        else:
+            bands['rhr_lower'] = bands['rhr_mean'] * 0.9
+            bands['rhr_upper'] = bands['rhr_mean'] * 1.1
+    else:
+        bands.update({'rhr_mean': None, 'rhr_std': None, 'rhr_upper': None, 'rhr_lower': None})
+
+    return bands
+
+# --- NUEVA FUNCIÓN PARA CHEQUEAR BANDAS ---
+def check_bands_status(hrv_ma7, rhr_ma7, bands_data):
+    """
+    Comprueba si el MA7 de HRV y RHR está dentro de las bandas de normalidad.
+    """
+    hrv_status, rhr_status = "DENTRO", "DENTRO"
+    hrv_color, rhr_color = "🟢", "🟢"
+    is_outside = False
+
+    # Chequeo HRV
+    if pd.notna(hrv_ma7) and pd.notna(bands_data.get('hrv_lower')):
+        if hrv_ma7 < bands_data['hrv_lower']:
+            hrv_status, hrv_color, is_outside = "FUERA (Bajo)", "🔴", True
+        elif pd.notna(bands_data.get('hrv_upper')) and hrv_ma7 > bands_data['hrv_upper']:
+            hrv_status, hrv_color = "FUERA (Alto)", "🟡" # HRV alto no es alarma
+    elif pd.isna(hrv_ma7):
+        hrv_status, hrv_color = "N/A", "⚪"
+        
+    # Chequeo RHR (Inverso)
+    if pd.notna(rhr_ma7) and pd.notna(bands_data.get('rhr_upper')):
+        if rhr_ma7 > bands_data['rhr_upper']:
+            rhr_status, rhr_color, is_outside = "FUERA (Alto)", "🔴", True
+        elif pd.notna(bands_data.get('rhr_lower')) and rhr_ma7 < bands_data['rhr_lower']:
+            rhr_status, rhr_color = "FUERA (Bajo)", "🟡" # RHR bajo no es alarma
+    elif pd.isna(rhr_ma7):
+        rhr_status, rhr_color = "N/A", "⚪"
+
+    return {
+        'is_outside': is_outside,
+        'hrv_status_text': f"{hrv_color} {hrv_status}",
+        'rhr_status_text': f"{rhr_color} {rhr_status}"
+    }
+
 def get_readiness_analysis(selected_date, df):
     if df.empty or pd.to_datetime(selected_date).strftime('%Y-%m-%d') not in df.index:
         return {"error": f"No hay datos de bienestar para el día {selected_date.strftime('%d-%m-%Y')}"}
@@ -251,6 +329,7 @@ def get_readiness_analysis(selected_date, df):
         R = max(0, min(100, int(score_s + score_r + score_h)))
         breakdown = s_brk + r_brk + h_brk
     
+    # --- CÁLCULO DEL VEREDICTO "ANTIGUO" (PARA COMPATIBILIDAD) ---
     verdict_text = "ERROR: No se pudo generar el veredicto" # Fallback
     if ier_recov_score < 40 or R < 50:
         verdict_text = "🔴 LUZ ROJA: Descanso o regenerativo."
@@ -261,13 +340,61 @@ def get_readiness_analysis(selected_date, df):
     else: 
         verdict_text = "🟡 LUZ AMARILLA: Rodaje moderado, evita sesiones duras."
         
+    # --- INICIO DE LA NUEVA LÓGICA (BANDAS + VEREDICTO PRIMARIO) ---
+    
+    # 1. Calcular Bandas de Normalidad (sobre los 60d previos)
+    df_60d_history = past_df.tail(min(60, len(past_df)))
+    bands_data = calculate_normality_bands(df_60d_history)
+    
+    # 2. Calcular MA7 de HRV y RHR (incluyendo hoy)
+    hrv_ma7 = df_including_today['hrv'].tail(7).mean()
+    rhr_ma7 = df_including_today['restingHR'].tail(7).mean()
+    
+    # 3. Comprobar estado de las bandas
+    bands_status = check_bands_status(hrv_ma7, rhr_ma7, bands_data)
+    is_bands_outside = bands_status['is_outside']
+
+    # 4. Generar Veredicto Primario (Nivel 1)
+    primary_verdict_text, primary_verdict_emoji, primary_verdict_color = "", "", ""
+    primary_verdict_recommendation = ""
+    
+    # --- Esta es la lógica de fusión ---
+    # (Umbral de R < 45 para la alarma, como propusimos)
+    if R < 45 or is_bands_outside:
+        primary_verdict_text = "ALARMA"
+        primary_verdict_emoji = "🔴"
+        primary_verdict_color = "#d9534f"
+        primary_verdict_recommendation = "Descanso total o Z1 regenerativo."
+    elif ier_recov_score >= 70 and R >= 70:
+        primary_verdict_text = "ÓPTIMO"
+        primary_verdict_emoji = "🟢"
+        primary_verdict_color = "#00FF7F"
+        primary_verdict_recommendation = "Luz verde para entrenar (calidad o volumen)."
+    else:
+        primary_verdict_text = "PRECAUCIÓN"
+        primary_verdict_emoji = "🟡"
+        primary_verdict_color = "#f0ad4e"
+        primary_verdict_recommendation = "Adaptar entreno (Z2 o recortar)."
+
+    # --- FIN DE LA NUEVA LÓGICA ---
+        
     return {
         "verdict": verdict_text, "readiness_score": R, "ier_recov_score": ier_recov_score,
         "metrics": {"VFC (HRV)": hrv_hoy, "FC Reposo": rhr_hoy, "Puntuación Sueño": sleep_score_hoy},
         "load_metrics": {"ctl": ctl_ayer, "atl": atl_ayer, "tsb": tsb_ayer},
-        "breakdown": breakdown
+        "breakdown": breakdown,
+        
+        # --- Devolver los nuevos valores ---
+        "primary_verdict": f"{primary_verdict_emoji} {primary_verdict_text}",
+        "primary_color": primary_verdict_color,
+        "primary_recommendation": primary_verdict_recommendation,
+        "bands_data": bands_data,
+        "bands_status": bands_status,
+        "hrv_ma7": hrv_ma7,
+        "rhr_ma7": rhr_ma7
     }
 
+# --- INICIO DE LA MODIFICACIÓN v4.0 (Pestaña 3) ---
 def generate_range_analysis(fecha_inicio, fecha_fin):
     extended_start = fecha_inicio - timedelta(days=90)
     df_wellness = get_wellness_data(extended_start, fecha_fin)
@@ -290,7 +417,9 @@ def generate_range_analysis(fecha_inicio, fecha_fin):
                     'date': date, 'ier_score': analysis.get('ier_recov_score'), 'readiness_score': analysis.get('readiness_score'),
                     'hrv': analysis.get('metrics', {}).get('VFC (HRV)'), 'rhr': analysis.get('metrics', {}).get('FC Reposo'),
                     'sleep_score': analysis.get('metrics', {}).get('Puntuación Sueño'), 'ctl': analysis.get('load_metrics', {}).get('ctl'),
-                    'atl': analysis.get('load_metrics', {}).get('atl'), 'tsb': analysis.get('load_metrics', {}).get('tsb')
+                    'atl': analysis.get('load_metrics', {}).get('atl'), 'tsb': analysis.get('load_metrics', {}).get('tsb'),
+                    # --- LÍNEA AÑADIDA ---
+                    'primary_verdict': analysis.get('primary_verdict', 'N/A') # Guardar el veredicto Nivel 1
                 })
         except Exception:
             continue
@@ -325,6 +454,7 @@ def generate_range_analysis(fecha_inicio, fecha_fin):
         'df_analysis': df_analysis, 'stats': stats, 'distribution': distribution,
         'trend': trend, 'problem_days': problem_days
     }
+# --- FIN DE LA MODIFICACIÓN v4.0 (generate_range_analysis) ---
 
 def create_range_charts(analysis_result):
     df_analysis = analysis_result['df_analysis']
@@ -352,21 +482,25 @@ def create_range_charts(analysis_result):
         charts['correlation'] = fig_corr
     return charts
 
+# --- INICIO DE LA MODIFICACIÓN v4.0 (Pestaña 3) ---
 def create_visual_metrics_table(df_analysis):
     table_data = []
     dias_es = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles', 'Thursday': 'Jueves', 'Friday': 'Viernes', 'Saturday': 'Sábado', 'Sunday': 'Domingo'}
     for _, row in df_analysis.iterrows():
-        interp = get_score_interpretation(row['ier_score'])
+        # interp = get_score_interpretation(row['ier_score']) # <-- Lógica antigua eliminada
         dia_semana = dias_es.get(row['date'].strftime('%A'), row['date'].strftime('%A'))
         table_data.append({
-            'Fecha': row['date'].strftime('%d/%m/%Y'), 'Día': dia_semana, 'Estado': f"{interp['emoji']} {interp['label']}",
-            'IER': f"{row['ier_score']:.1f}", 'Readiness': f"{row['readiness_score']:.0f}",
+            'Fecha': row['date'].strftime('%d/%m/%Y'), 'Día': dia_semana, 
+            'Estado': row['primary_verdict'], # <-- Usar el nuevo Veredicto Nivel 1
+            'IER': f"{row['ier_score']:.1f}", 
+            'Readiness': f"{row['readiness_score']:.0f}",
             'HRV': f"{row['hrv']:.1f}" if pd.notna(row['hrv']) else "N/A",
             'FC Reposo': f"{row['rhr']:.0f}" if pd.notna(row['rhr']) else "N/A",
             'Sueño': f"{row['sleep_score']:.0f}" if pd.notna(row['sleep_score']) else "N/A",
             'TSB': f"{row['tsb']:.1f}" if pd.notna(row['tsb']) else "N/A"
         })
     return pd.DataFrame(table_data)
+# --- FIN DE LA MODIFICACIÓN v4.0 (create_visual_metrics_table) ---
 
 def display_comparative_dashboard(readiness_score, ier_score, prev_readiness_score, prev_ier_score, df_history, selected_date):
     readiness_interp, ier_interp = get_score_interpretation(readiness_score), get_score_interpretation(ier_score)
@@ -394,40 +528,43 @@ def display_comparative_dashboard(readiness_score, ier_score, prev_readiness_sco
                 <p style="font-size: 1.1em; margin-top: 5px; font-weight: bold;">{ier_interp['emoji']} {ier_interp['label']} {ier_trend}</p>
                 <span class="tooltip-text">{ier_interp['description']}</span></div></div>
         <div class="col-md-5 dashboard-col" style="padding-left: 20px;"><h3 style="font-size: 1.0em; color: #a0a0a0;">Readiness Global</h3>
-               <div class="tooltip-container" style="margin-top: 38px;">
+                <div class="tooltip-container" style="margin-top: 38px;">
                 <span class="score-secondary" style="color: {readiness_interp['color']};">{readiness_score}</span>
                 <p style="font-size: 1.0em; margin-top: 5px; font-weight: bold;">{readiness_interp['emoji']} {readiness_interp['label']} {readiness_trend}</p>
                 <span class="tooltip-text">{readiness_interp['description']}</span></div></div></div></div>"""
     st.markdown(dashboard_html, unsafe_allow_html=True)
 
+# --- INICIO DE LA MODIFICACIÓN v3.9 ---
 def generate_coaching_summary(analysis):
-    verdict = analysis.get('verdict', '')
+    # Usar el nuevo veredicto primario
+    primary_verdict = analysis.get('primary_verdict', 'N/A') # e.g., "🔴 ALARMA"
+    primary_recommendation = analysis.get('primary_recommendation', '...') # e.g., "Descanso total..."
     
-    patron, plan = "N/A", "N/A"
-    if "VERDE" in verdict:
-        patron = "✅ Combinación Óptima: Tanto tu tendencia (IER) como tu estado de hoy (Readiness) son buenos."
-        plan = "Luz verde total. Día ideal para sesiones de calidad (SST, Umbral)."
-    elif "IER bueno pero Readiness bajo" in verdict:
-        patron = "🟡 Conflicto de Señales: Tu tendencia (IER) es buena, pero tu estado de hoy (Readiness) es bajo. Priorizamos seguridad."
-        plan = "Rodaje suave en Z2 o descanso activo."
-    elif "Rodaje moderado" in verdict:
-        patron = "🟡 Precaución: El sistema muestra señales mixtas. No es día para forzar, sino para consolidar."
-        plan = "Mantén un volumen moderado en Z2/Z3. Evita sesiones de alta intensidad."
-    elif "ROJA" in verdict:
-        patron = "🔴 Fatiga Elevada: El sistema nervioso y fisiológico pide una tregua."
-        plan = "Descanso total o un paseo muy suave (Z1)."
-    
+    # Get the metrics
     hrv_hoy, rhr_hoy = analysis.get('metrics', {}).get('VFC (HRV)'), analysis.get('metrics', {}).get('FC Reposo')
     hrv_text = f"{hrv_hoy:.1f} ms" if pd.notna(hrv_hoy) else "N/A"
     rhr_text = f"{rhr_hoy:.0f} bpm" if pd.notna(rhr_hoy) else "N/A"
-    
-    return f"**Veredicto:** {verdict}\n**HRV/RHR Hoy:** {hrv_text} / {rhr_text}\n**Patrón:** {patron}\n**Plan del Día:** {plan}"
 
-def quick_decision_visual(verdict):
-    st.markdown(f"<h4>{verdict}</h4>", unsafe_allow_html=True)
+    # Get the "Patrón" (the "why") from the 3 pillars
+    readiness_interp = get_score_interpretation(analysis.get('readiness_score'))
+    ier_interp = get_score_interpretation(analysis.get('ier_recov_score'))
+    bands_status = analysis.get('bands_status', {})
+    hrv_status_raw = bands_status.get('hrv_status_text', 'N/A')
+    rhr_status_raw = bands_status.get('rhr_status_text', 'N/A')
+    
+    # Clean emojis from status texts for this summary
+    hrv_status_clean = hrv_status_raw.split(' ', 1)[-1] if ' ' in hrv_status_raw else hrv_status_raw
+    rhr_status_clean = rhr_status_raw.split(' ', 1)[-1] if ' ' in rhr_status_raw else rhr_status_raw
+
+    # Build the pattern string
+    patron = f"Pilar 1 (Agudo): {readiness_interp['label']} ({analysis.get('readiness_score', 0):.0f}) | Pilar 2 (Tendencia): {ier_interp['label']} ({analysis.get('ier_recov_score', 0):.1f}) | Pilar 3 (Estabilidad): {hrv_status_clean} & {rhr_status_clean}"
+
+    # Return the new summary string, aligned with the primary verdict
+    return f"**Veredicto IA:** {primary_verdict} ({primary_recommendation})\n**HRV/RHR Hoy:** {hrv_text} / {rhr_text}\n**Patrón de Pilares:** {patron}"
+# --- FIN DE LA MODIFICACIÓN v3.9 ---
 
 # --- INTERFAZ PRINCIPAL ---
-st.title("🧠 Coach IA de Readiness v3.5")
+st.title("🧠 Coach IA de Readiness v3.6 - Híbrido")
 selected_date = st.date_input("Selecciona la fecha de análisis:", datetime.now().date(), max_value=datetime.now().date())
 df_full = get_wellness_data(selected_date - timedelta(days=90), selected_date)
 
@@ -442,17 +579,74 @@ else:
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Readiness Diario", "❤️ Líneas Basales", "🗓️ Resumen por Rango", "🔬 Validación del Modelo"])
         
         with tab1:
-            st.subheader("🚦 Veredicto Rápido del Día")
-            quick_decision_visual(analysis.get('verdict', ''))
             
+            # --- INICIO NIVEL 1: VEREDICTO PRIMARIO ---
+            st.subheader("Nivel 1: Veredicto del Coach IA")
+            primary_html = f"""
+            <div class="card" style="border: 2px solid {analysis.get('primary_color', '#a0a0a0')}; text-align: center; padding: 25px;">
+                <h1 style="color: {analysis.get('primary_color', '#FAFAFA')}; font-size: 2.8em; margin-bottom: 5px; font-weight: bold;">
+                    {analysis.get('primary_verdict', 'N/A')}
+                </h1>
+                <p style="font-size: 1.2em; margin-top: 5px;">
+                    {analysis.get('primary_recommendation', '...')}
+                </p>
+            </div>
+            """
+            st.markdown(primary_html, unsafe_allow_html=True)
+            # --- FIN NIVEL 1 ---
+
+            # --- INICIO NIVEL 2: LOS 3 PILARES ---
+            st.subheader("Nivel 2: Los 3 Pilares del Veredicto")
+            
+            # Obtener datos para los pilares
+            ier_interp = get_score_interpretation(analysis.get('ier_recov_score'))
+            readiness_interp = get_score_interpretation(analysis.get('readiness_score'))
+            bands_status = analysis.get('bands_status', {})
+            hrv_status_text = bands_status.get('hrv_status_text', 'N/A')
+            rhr_status_text = bands_status.get('rhr_status_text', 'N/A')
+            
+            p_col1, p_col2, p_col3 = st.columns(3)
+            with p_col1:
+                st.markdown(f"""<div class="card">
+                    <h5 style="text-align: center; color: {st.session_state.primary_color};">Pilar 1: Estado Agudo</h5>
+                    <p style="font-size: 2.2em; text-align: center; font-weight: bold; color: {readiness_interp['color']}; margin-bottom: 0;">
+                        {analysis.get('readiness_score', 0):.0f}
+                    </p>
+                    <p style="font-size: 1.1em; text-align: center; margin-top: 0;">{readiness_interp['emoji']} {readiness_interp['label']}</p>
+                    <p style="font-size: 0.8em; text-align: center; color: #a0a0a0;"><em>(Fatiga de "hoy")</em></p>
+                </div>""", unsafe_allow_html=True)
+            with p_col2:
+                st.markdown(f"""<div class="card">
+                    <h5 style="text-align: center; color: {st.session_state.primary_color};">Pilar 2: Tendencia</h5>
+                    <p style="font-size: 2.2em; text-align: center; font-weight: bold; color: {ier_interp['color']}; margin-bottom: 0;">
+                        {analysis.get('ier_recov_score', 0):.1f}
+                    </p>
+                    <p style="font-size: 1.1em; text-align: center; margin-top: 0;">{ier_interp['emoji']} {ier_interp['label']}</p>
+                    <p style="font-size: 0.8em; text-align: center; color: #a0a0a0;"><em>(Adaptación 7 vs 21d)</em></p>
+                </div>""", unsafe_allow_html=True)
+            with p_col3:
+                st.markdown(f"""<div class="card">
+                    <h5 style="text-align: center; color: {st.session_state.primary_color};">Pilar 3: Estabilidad</h5>
+                    <p style="font-size: 1.2em; text-align: center; font-weight: bold; margin-bottom: 0; margin-top: 18px;">
+                        HRV: {hrv_status_text}
+                    </p>
+                    <p style="font-size: 1.2em; text-align: center; font-weight: bold; margin-top: 0; margin-bottom: 22px;">
+                        RHR: {rhr_status_text}
+                    </p>
+                    <p style="font-size: 0.8em; text-align: center; color: #a0a0a0;"><em>(MA7 vs Banda 60d)</em></p>
+                </div>""", unsafe_allow_html=True)
+            # --- FIN NIVEL 2 ---
+            
+            st.markdown("---")
             load = analysis.get("load_metrics", {})
             ctl, atl, tsb = load.get('ctl'), load.get('atl'), load.get('tsb')
             g_col1, g_col2, g_col3 = st.columns(3)
             with g_col1: st.metric(label="Forma (CTL) Ayer", value=f"{ctl:.1f}" if pd.notna(ctl) else "N/A")
             with g_col2: st.metric(label="Fatiga (ATL) Ayer", value=f"{atl:.1f}" if pd.notna(atl) else "N/A")
             with g_col3: st.metric(label="Frescura (TSB) Ayer", value=f"{tsb:.1f}" if pd.notna(tsb) else "N/A")
+            st.markdown("---")
             
-            st.subheader("📊 Dashboard Comparativo del Día")
+            st.subheader("Nivel 3: Desglose de Scores (IER vs Readiness)")
 
             prev_readiness_score, prev_ier_score = None, None
             prev_date = selected_date - timedelta(days=1)
@@ -476,6 +670,7 @@ else:
                 <li>🟢✨ <strong>85–100 → Excelente:</strong> Entreno clave / SST largo.</li></ul></div>""", unsafe_allow_html=True)
             
             with st.expander("⚡️ Coaching Rápido IA (Análisis para José)"):
+                # Esta función ahora está actualizada
                 coaching_summary_text = generate_coaching_summary(analysis)
                 st.markdown(coaching_summary_text)
 
@@ -498,9 +693,29 @@ else:
                 sleep_text = f"{sleep:.0f}" if pd.notna(sleep) else "N/A"
                 resumen_texto = f"**Resumen de Salud para el {selected_date.strftime('%d/%m/%Y')}**\n\n"
                 resumen_texto += f"**Carga (Ayer):** CTL: {f'{ctl:.1f}' if pd.notna(ctl) else 'N/A'}, ATL: {f'{atl:.1f}' if pd.notna(atl) else 'N/A'}, TSB: {f'{tsb:.1f}' if pd.notna(tsb) else 'N/A'}\n---\n"
-                resumen_texto += f"**Veredicto:** {analysis.get('verdict', 'N/A')}\n"
-                resumen_texto += f"**IER (Score Principal):** {analysis.get('ier_recov_score', 'N/A'):.1f} / 100\n"
-                resumen_texto += f"**Readiness (Score Secundario):** {analysis.get('readiness_score', 'N/A')} / 100\n---\n"
+                
+                # Quitar emojis del Veredicto IA
+                verdict_with_emoji = analysis.get('primary_verdict', 'N/A')
+                verdict_text_only = verdict_with_emoji.split(' ', 1)[-1] if ' ' in verdict_with_emoji else verdict_with_emoji
+                verdict_recommendation = analysis.get('primary_recommendation', '...')
+                resumen_texto += f"**VEREDICTO IA:** {verdict_text_only} ({verdict_recommendation})\n---\n"
+                
+                # Quitar "Veredicto Antiguo" (ELIMINADO)
+                
+                # Añadir Pilares 1, 2 y 3 sin emojis + Contexto Pilar 3
+                bands_status = analysis.get('bands_status', {})
+                hrv_status_raw = bands_status.get('hrv_status_text', 'N/A')
+                rhr_status_raw = bands_status.get('rhr_status_text', 'N/A')
+                
+                # Usamos .split(' ', 1)[-1] para coger todo después del primer espacio (ej. "DENTRO" o "FUERA (Bajo)")
+                hrv_status_clean = hrv_status_raw.split(' ', 1)[-1] if ' ' in hrv_status_raw else hrv_status_raw
+                rhr_status_clean = rhr_status_raw.split(' ', 1)[-1] if ' ' in rhr_status_raw else rhr_status_raw
+                
+                resumen_texto += f"**Pilar 1 (Estado Agudo):** Readiness: {analysis.get('readiness_score', 'N/A'):.0f}\n"
+                resumen_texto += f"**Pilar 2 (Tendencia):** IER: {analysis.get('ier_recov_score', 'N/A'):.1f}\n"
+                # Contexto añadido a Pilar 3 como solicitó el usuario
+                resumen_texto += f"**Pilar 3 (Estabilidad):** HRV: {hrv_status_clean} | RHR: {rhr_status_clean} (MA7 vs Banda 60d)\n---\n" 
+                
                 resumen_texto += f"**Métricas Clave:** HRV: {hrv_text} ms | RHR: {rhr_text} bpm | Sueño: {sleep_text}\n\n---\n**Líneas Basales:**\n"
                 baselines = calculate_baselines(df_full[df_full.index < pd.to_datetime(selected_date)])
                 for key, name in baseline_types.items():
@@ -530,6 +745,43 @@ else:
                         st.metric("FC Reposo Media", f"{rhr_base:.1f}" if pd.notna(rhr_base) else "N/A")
                         st.metric("VFC (HRV) Media", f"{hrv_base:.1f}" if pd.notna(hrv_base) else "N/A")
                         st.metric("Fatiga (ATL) Media", f"{atl_base:.1f}" if pd.notna(atl_base) else "N/A")
+            
+            # --- INICIO DE LA NUEVA SECCIÓN DE BANDAS ---
+            st.markdown("---")
+            st.header("📊 Tus Bandas de Normalidad (Lógica del Vídeo)")
+            st.info("Calculadas sobre tu historial de 60 días. El 'Pilar 3' comprueba si tu media de 7 días (MA7) se sale de estas bandas.", icon="ℹ️")
+
+            # Usamos los datos de las bandas calculados en el análisis del día
+            bands_data = analysis.get('bands_data', {})
+            hrv_ma7 = analysis.get('hrv_ma7')
+            rhr_ma7 = analysis.get('rhr_ma7')
+
+            band_col1, band_col2 = st.columns(2)
+            with band_col1:
+                st.subheader("VFC (HRV)")
+                if pd.notna(hrv_ma7):
+                    st.metric(label="Tu MA7 Actual", value=f"{hrv_ma7:.1f} ms")
+                else:
+                    st.metric(label="Tu MA7 Actual", value="N/A")
+                
+                st.markdown(f"""
+                - **Banda Inferior (Alarma):** `{bands_data.get('hrv_lower'):.1f} ms`
+                - **Media (60d):** `{bands_data.get('hrv_mean'):.1f} ms`
+                - **Banda Superior:** `{bands_data.get('hrv_upper'):.1f} ms`
+                """)
+            with band_col2:
+                st.subheader("FC Reposo (RHR)")
+                if pd.notna(rhr_ma7):
+                    st.metric(label="Tu MA7 Actual", value=f"{rhr_ma7:.1f} bpm")
+                else:
+                    st.metric(label="Tu MA7 Actual", value="N/A")
+                
+                st.markdown(f"""
+                - **Banda Inferior:** `{bands_data.get('rhr_lower'):.1f} bpm`
+                - **Media (60d):** `{bands_data.get('rhr_mean'):.1f} bpm`
+                - **Banda Superior (Alarma):** `{bands_data.get('rhr_upper'):.1f} bpm`
+                """)
+            # --- FIN DE LA NUEVA SECCIÓN DE BANDAS ---
         
         with tab3:
             st.header("🗓️ Análisis por Rango de Fechas")
@@ -569,6 +821,10 @@ else:
                             st.subheader("Datos Detallados del Periodo")
                             df_visual = create_visual_metrics_table(analysis_result['df_analysis'])
                             st.dataframe(df_visual, use_container_width=True)
+                            
+                            with st.expander("📋 Copiar datos de la tabla"):
+                                markdown_table = df_visual.to_markdown(index=False)
+                                st.code(markdown_table, language='markdown')
 
         with tab4:
             st.header("🔬 Validación del Modelo (IER vs Readiness)")
