@@ -34,22 +34,29 @@ def fetch_data_for_week(start_date, end_date):
 
     return wellness_data, activities_data
 
-def process_weekly_data(end_date, num_weeks=12):
+def process_weekly_data(start_date, end_date):
     """
-    Procesa los datos para devolver un DataFrame con métricas semanales.
-    NUEVA LÓGICA: Realiza una llamada a la API por cada semana para asegurar la obtención de todos los datos.
+    Procesa los datos para devolver un DataFrame con métricas semanales para el rango especificado.
     """
     weekly_summary = []
-
+    
+    # Calcular el número de semanas en el rango
+    delta_days = (end_date - start_date).days
+    num_weeks = delta_days // 7 + 1
+    
     for i in range(num_weeks):
-        week_end = end_date - timedelta(days=i*7)
-        week_start = week_end - timedelta(days=6)
+        week_start = start_date + timedelta(days=i*7)
+        week_end = min(week_start + timedelta(days=6), end_date)
         
+        # Si week_start es mayor que end_date, terminar el bucle
+        if week_start > end_date:
+            break
+            
         wellness_data, activities_data = fetch_data_for_week(week_start, week_end)
-
+        
         if not wellness_data and not activities_data:
             continue
-
+        
         total_tss = 0
         for activity in activities_data:
             if activity.get('type') == 'WeightTraining':
@@ -76,17 +83,35 @@ def process_weekly_data(end_date, num_weeks=12):
         return pd.DataFrame()
 
     df = pd.DataFrame(weekly_summary).set_index('Semana')
-    return df.iloc[::-1]
+    return df
 
 # --- INTERFAZ DE USUARIO ---
 st.set_page_config(layout="wide")
 st.title("🔬 Correlaciones y Línea Basal")
-st.write("Esta sección analiza la relación entre tu carga de entrenamiento y tus métricas de bienestar durante las últimas 12 semanas.")
+st.write("Esta sección analiza la relación entre tu carga de entrenamiento y tus métricas de bienestar.")
 
-end_date = st.date_input("Selecciona la fecha final del análisis", datetime.now().date())
+# Selector de rango de fechas
+col_fecha1, col_fecha2 = st.columns(2)
+with col_fecha1:
+    start_date = st.date_input(
+        "Fecha de inicio del análisis:", 
+        value=(datetime.now() - timedelta(days=84)).date(),  # 12 semanas por defecto
+        key="start_date_correlations"
+    )
+with col_fecha2:
+    end_date = st.date_input(
+        "Fecha final del análisis:", 
+        value=datetime.now().date(),
+        key="end_date_correlations"
+    )
+
+# Validar rango de fechas
+if start_date > end_date:
+    st.error("⚠️ La fecha de inicio debe ser anterior a la fecha final.")
+    st.stop()
 
 if end_date:
-    df_weekly = process_weekly_data(end_date)
+    df_weekly = process_weekly_data(start_date, end_date)
 
     if df_weekly.empty:
         st.warning("No hay suficientes datos en el periodo seleccionado para realizar el análisis.")
@@ -120,17 +145,50 @@ if end_date:
             if not baseline_historic.empty:
                 st.metric("RHR", f"{baseline_historic.get('RHR', 0):.1f} bpm")
                 st.metric("HRV", f"{baseline_historic.get('HRV', 0):.1f} ms")
-        
+
         st.markdown("---")
-        
+
         st.header("🔥 Mapa de Calor de Correlaciones")
         st.caption("Este mapa muestra cómo se relacionan tus métricas. Valores cercanos a 1 indican una relación positiva fuerte; cercanos a -1, una relación negativa fuerte.")
-        
+
         correlation_matrix = df_weekly.corr(method='pearson')
         fig, ax = plt.subplots(figsize=(10, 8))
         sns.heatmap(correlation_matrix, ax=ax, annot=True, cmap='viridis', fmt=".2f")
         st.pyplot(fig)
+
+        # --- NUEVA SECCIÓN: TABLA DE CORRELACIONES COPIABLE ---
+        st.subheader("📊 Tabla de Correlaciones - Para Copiar y Pegar")
         
+        # Convertir la matriz de correlación a formato tabla copiable
+        correlation_df = correlation_matrix.round(2)
+        
+        with st.expander("📋 Matriz de Correlaciones en Formato Tabla", expanded=True):
+            # Crear texto formateado para copiar
+            correlation_text = f"**MATRIZ DE CORRELACIONES**\n"
+            correlation_text += f"**Período:** {start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}\n\n"
+            
+            # Crear encabezados
+            metrics = correlation_df.columns.tolist()
+            correlation_text += "Métrica".ljust(12)
+            for metric in metrics:
+                correlation_text += f"{metric}".ljust(12)
+            correlation_text += "\n" + "-" * (12 + len(metrics) * 12) + "\n"
+            
+            # Crear filas de datos
+            for index, row in correlation_df.iterrows():
+                correlation_text += f"{index}".ljust(12)
+                for value in row:
+                    correlation_text += f"{value:.2f}".ljust(12)
+                correlation_text += "\n"
+            
+            correlation_text += "\n**Interpretación:**\n"
+            correlation_text += "- Valores cercanos a 1.00: Correlación positiva fuerte\n"
+            correlation_text += "- Valores cercanos a -1.00: Correlación negativa fuerte\n"
+            correlation_text += "- Valores cercanos a 0.00: Sin correlación significativa\n"
+            
+            st.code(correlation_text, language='text')
+            st.info("💡 **Tip:** Selecciona todo el texto del cuadro superior (Ctrl+A) y cópialo (Ctrl+C) para pegarlo donde necesites.")
+
         st.markdown("---")
-        st.header("📋 Resumen de las Últimas 12 Semanas")
+        st.header("📋 Resumen de las Últimas Semanas")
         st.dataframe(df_weekly.style.format("{:.1f}", na_rep="-"), use_container_width=True)
