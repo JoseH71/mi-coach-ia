@@ -17,7 +17,7 @@ st.set_page_config(
 if 'primary_color' not in st.session_state: st.session_state.primary_color = "#00aaff"
 if 'background_color' not in st.session_state: st.session_state.background_color = "#0E1117"
 if 'secondary_background_color' not in st.session_state: st.session_state.secondary_background_color = "#1C1E26"
-if 'text_color' not in st.session_state: st.session_state.text_color = "#FAFAFA"
+if 'text_color' not in st.session_state: st.session_state.text_color = "#83D0E8"
 if 'card_border_base_color' not in st.session_state: st.session_state.card_border_base_color = "#00aaff"
 if 'card_border_alpha' not in st.session_state: st.session_state.card_border_alpha = 34
 # --- INICIALIZACIÓN MFI ---
