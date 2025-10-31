@@ -8,7 +8,7 @@ import plotly.express as px
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
-    page_title="Coach IA de Readiness v3.8 - MFI", # Versión actualizada
+    page_title="Coach IA de Readiness v3.9 - GuardRail", # Versión actualizada
     page_icon="🧠",
     layout="wide"
 )
@@ -320,7 +320,7 @@ def check_bands_status(hrv_ma7, rhr_ma7, bands_data):
         'rhr_status_text': f"{rhr_color} {rhr_status}"
     }
 
-# --- FUNCIÓN MODIFICADA PARA ACEPTAR MFI ---
+# --- FUNCIÓN MODIFICADA v3.9 ---
 def get_readiness_analysis(selected_date, df, mfi_score): # Añadido mfi_score
     if df.empty or pd.to_datetime(selected_date).strftime('%Y-%m-%d') not in df.index:
         return {"error": f"No hay datos de bienestar para el día {selected_date.strftime('%d-%m-%Y')}"}
@@ -339,6 +339,9 @@ def get_readiness_analysis(selected_date, df, mfi_score): # Añadido mfi_score
 
     past_df = df_including_today.iloc[:-1]
     R, breakdown = 50, []
+    baselines = {} # Inicializar baselines
+    historic_baseline_df = pd.DataFrame() # Inicializar
+    
     if not past_df.empty:
         baselines = calculate_baselines(past_df)
         historic_baseline_df = past_df.tail(min(60, len(past_df)))
@@ -356,10 +359,10 @@ def get_readiness_analysis(selected_date, df, mfi_score): # Añadido mfi_score
     bands_status = check_bands_status(hrv_ma7, rhr_ma7, bands_data)
     is_bands_outside = bands_status['is_outside']
 
-    primary_verdict_text = "" # Texto base: ALARMA, PRECAUCION, OPTIMO
+    primary_verdict_text = ""
     primary_verdict_emoji = ""
     primary_verdict_color = ""
-    base_recommendation = "" # Recomendación fisiológica base
+    base_recommendation = ""
 
     condition_bands_alarm = is_bands_outside and (tsb_ayer is None or tsb_ayer < 10)
 
@@ -379,27 +382,59 @@ def get_readiness_analysis(selected_date, df, mfi_score): # Añadido mfi_score
         primary_verdict_color = "#f0ad4e"
         base_recommendation = "Adaptar entreno (Z2 o recortar)."
 
+    # --- INICIO: MICROFILTRO (GUARD-RAIL) v3.9 ---
+    if primary_verdict_text == "ÓPTIMO":
+        # Si el veredicto es ÓPTIMO, hacemos un chequeo agudo
+        
+        # 1. Chequeo Sueño Agudo
+        guard_rail_sleep = pd.notna(sleep_score_hoy) and sleep_score_hoy < 70 # Sueño < 70
+
+        # 2. Chequeo RHR Agudo
+        guard_rail_rhr = False
+        rhr_baseline_rec = baselines.get('recovery', pd.Series()).get('restingHR')
+        if pd.notna(rhr_hoy) and pd.notna(rhr_baseline_rec):
+            if rhr_hoy >= (rhr_baseline_rec + 2): # RHR >= +2bpm vs basal rec
+                guard_rail_rhr = True
+
+        # 3. Chequeo HRV Agudo
+        guard_rail_hrv = False
+        if not historic_baseline_df.empty: # Asegurarse que no esté vacío
+            hrv_baseline_hist_mean = historic_baseline_df['hrv'].mean()
+            hrv_baseline_hist_std = historic_baseline_df['hrv'].std()
+            if pd.notna(hrv_hoy) and pd.notna(hrv_baseline_hist_mean) and pd.notna(hrv_baseline_hist_std) and hrv_baseline_hist_std > 0:
+                if hrv_hoy < (hrv_baseline_hist_mean - (1 * hrv_baseline_hist_std)): # HRV < -1 SD vs Histórico
+                    guard_rail_hrv = True
+        
+        is_acute_alarm = guard_rail_sleep or guard_rail_rhr or guard_rail_hrv
+
+        if is_acute_alarm:
+            # Si una métrica aguda falla, DEGRADAR a PRECAUCIÓN
+            primary_verdict_text = "PRECAUCIÓN"
+            primary_verdict_emoji = "🟡"
+            primary_verdict_color = "#f0ad4e"
+            base_recommendation = "Adaptar (Z2/recortar). (ÓPTIMO degradado por métricas agudas bajas)"
+    # --- FIN: MICROFILTRO (GUARD-RAIL) v3.9 ---
+
+
     # --- MODULACIÓN DE LA RECOMENDACIÓN POR MFI v3.8 ---
-    final_recommendation = base_recommendation # Empezar con la recomendación base
+    final_recommendation = base_recommendation
 
     if primary_verdict_text == "ALARMA":
-        # Permitir Z1 regenerativo MUY CORTO solo si MFI alto y TSB muy positivo
         if mfi_score >= 2 and (tsb_ayer is not None and tsb_ayer > 5):
              final_recommendation = "Descanso total o Z1 regenerativo MUY CORTO (<30min, <105bpm) si MFI>=2."
         else:
-             final_recommendation = "Descanso total." # Más seguro si TSB no es muy alto o MFI bajo
+             final_recommendation = "Descanso total."
     elif primary_verdict_text == "PRECAUCIÓN":
-        # Ofrecer Z1 terapéutico si MFI alto y TSB positivo
         if mfi_score >= 2 and (tsb_ayer is None or tsb_ayer > 0):
-             final_recommendation = "Z1 terapéutico 30–45min (<110 bpm) para descompresión mental O Z2 suave/recortado."
-        # Si no hay fatiga mental, mantener la recomendación estándar
-        # else: final_recommendation = base_recommendation # Ya es "Adaptar (Z2 o recortar)"
+             # Si la recomendación base ya fue degradada, añadir la opción Z1
+             if "degradado" in base_recommendation:
+                 final_recommendation = f"Z1 terapéutico 30–45min (<110 bpm) O {base_recommendation}"
+             else:
+                 final_recommendation = "Z1 terapéutico 30–45min (<110 bpm) para descompresión mental O Z2 suave/recortado."
     elif primary_verdict_text == "ÓPTIMO":
-        # Priorizar bienestar si MFI muy alto
         if mfi_score == 3:
             final_recommendation = "Sesión corta y placentera (Z1/Z2). Prioriza bienestar hoy."
-        # Si no, mantener recomendación estándar
-        # else: final_recommendation = base_recommendation # Ya es "Luz verde..."
+        # else: final_recommendation = base_recommendation # Se mantiene
 
     # --- FIN MODULACIÓN MFI ---
 
@@ -408,14 +443,14 @@ def get_readiness_analysis(selected_date, df, mfi_score): # Añadido mfi_score
         "metrics": {"VFC (HRV)": hrv_hoy, "FC Reposo": rhr_hoy, "Puntuación Sueño": sleep_score_hoy},
         "load_metrics": {"ctl": ctl_ayer, "atl": atl_ayer, "tsb": tsb_ayer},
         "breakdown": breakdown,
-        "primary_verdict": f"{primary_verdict_emoji} {primary_verdict_text}", # El veredicto no cambia
+        "primary_verdict": f"{primary_verdict_emoji} {primary_verdict_text}",
         "primary_color": primary_verdict_color,
-        "primary_recommendation": final_recommendation, # Devolver la recomendación modulada
+        "primary_recommendation": final_recommendation,
         "bands_data": bands_data,
         "bands_status": bands_status,
         "hrv_ma7": hrv_ma7,
         "rhr_ma7": rhr_ma7,
-        "mfi_score": mfi_score # Devolver el MFI usado
+        "mfi_score": mfi_score
     }
 
 # --- Resto de funciones (generate_range_analysis, etc.) SIN CAMBIOS ---
@@ -429,11 +464,9 @@ def generate_range_analysis(fecha_inicio, fecha_fin):
     if range_wellness.empty:
         return {"error": "No hay datos de bienestar en el rango seleccionado"}
     daily_analysis = []
-    # --- Modificado para pasar un MFI por defecto (e.g., 1) para el análisis de rango ---
     default_mfi_for_range = 1
     for date in range_wellness.index:
         try:
-            # Pasar MFI por defecto aquí
             analysis = get_readiness_analysis(date.date(), df_wellness, default_mfi_for_range)
             if "error" not in analysis:
                 daily_analysis.append({
@@ -445,7 +478,6 @@ def generate_range_analysis(fecha_inicio, fecha_fin):
                 })
         except Exception:
             continue
-    # --- Fin Modificación Rango ---
     if not daily_analysis:
         return {"error": "No se pudieron procesar los análisis diarios"}
     df_analysis = pd.DataFrame(daily_analysis)
@@ -488,18 +520,18 @@ def create_range_charts(analysis_result):
     values = [distribution['excelente'], distribution['bueno'], distribution['medio'], distribution['bajo'], distribution['muy_bajo']]
     colors = ['#00FF7F', '#5cb85c', '#f0ad4e', '#E59434', '#d9534f']
     fig_dist = go.Figure(data=go.Pie(labels=labels, values=values, hole=0.4, marker_colors=colors))
-    fig_dist.update_layout(title='Distribución de Estados de IER', height=550)
+    fig_dist.update_layout(title='Distribución de Estados de IER', height=500)
     charts['distribution'] = fig_dist
     if not df_analysis['hrv'].dropna().empty and not df_analysis['rhr'].dropna().empty:
         fig_corr = go.Figure()
         fig_corr.add_trace(go.Scatter(x=df_analysis['hrv'], y=df_analysis['rhr'], mode='markers', marker=dict(size=8, color=df_analysis['ier_score'], colorscale='RdYlGn', showscale=True, colorbar=dict(title="IER Score")), text=df_analysis['date'].dt.strftime('%d/%m'), hovertemplate='<b>%{text}</b><br>HRV: %{x}<br>RHR: %{y}<extra></extra>'))
-        fig_corr.update_layout(title='Relación HRV vs FC Reposo', xaxis_title='HRV (ms)', yaxis_title='FC Reposo (bpm)', height=550)
+        fig_corr.update_layout(title='Relación HRV vs FC Reposo', xaxis_title='HRV (ms)', yaxis_title='FC Reposo (bpm)', height=500)
         charts['correlation'] = fig_corr
     return charts
 
 
 def create_visual_metrics_table(df_analysis):
-    # ... (sin cambios, ya usaba primary_verdict) ...
+    # ... (sin cambios) ...
     table_data = []
     dias_es = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles', 'Thursday': 'Jueves', 'Friday': 'Viernes', 'Saturday': 'Sábado', 'Sunday': 'Domingo'}
     for _, row in df_analysis.iterrows():
@@ -548,7 +580,7 @@ def display_comparative_dashboard(readiness_score, ier_score, prev_readiness_sco
     st.markdown(dashboard_html, unsafe_allow_html=True)
 
 
-# --- FUNCIÓN MODIFICADA PARA USAR RECOMENDACIÓN FINAL ---
+# --- FUNCIÓN MODIFICADA v3.9 (para usar recomendación final) ---
 def generate_coaching_summary(analysis):
     # Usar el veredicto y la recomendación FINAL (modulada por MFI)
     primary_verdict = analysis.get('primary_verdict', 'N/A')
@@ -573,17 +605,16 @@ def generate_coaching_summary(analysis):
     return f"**Veredicto IA:** {primary_verdict} ({final_recommendation})\n**HRV/RHR Hoy:** {hrv_text} / {rhr_text}\n**Patrón de Pilares:** {patron}"
 
 # --- INTERFAZ PRINCIPAL ---
-st.title("🧠 Coach IA de Readiness v3.8 - MFI") # Título actualizado
+st.title("🧠 Coach IA de Readiness v3.9 - GuardRail") # Título actualizado
 selected_date = st.date_input("Selecciona la fecha de análisis:", datetime.now().date(), max_value=datetime.now().date())
 
 # --- INICIO: WIDGET MFI (Opción 1: st.radio) ---
 mfi_options = {0: "😄 Motivado", 1: "🙂 Neutro", 2: "😕 Saturado", 3: "😩 Bloqueado"}
 
-# 1. Invertimos el diccionario para poder buscar el "score" (0, 1, 2)
-#    a partir del "label" ("😄 Motivado", "🙂 Neutro", etc.)
+# 1. Invertimos el diccionario
 mfi_labels_to_scores = {v: k for k, v in mfi_options.items()}
 
-# 2. Creamos la lista de opciones (los labels) en el orden correcto
+# 2. Creamos la lista de opciones (los labels)
 mfi_labels_list = list(mfi_options.values())
 
 # 3. Creamos el widget st.radio
@@ -595,7 +626,7 @@ selected_label = st.radio(
     key="mfi_radio"
 )
 
-# 4. Actualizamos el session_state con el score numérico correspondiente
+# 4. Actualizamos el session_state con el score numérico
 st.session_state.mfi_score = mfi_labels_to_scores[selected_label]
 # --- FIN: WIDGET MFI ---
 
@@ -613,6 +644,7 @@ else:
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Readiness Diario", "❤️ Líneas Basales", "🗓️ Resumen por Rango", "🔬 Validación del Modelo"])
         with tab1:
             st.subheader("Nivel 1: Veredicto del Coach IA")
+            # --- CORRECCIÓN DE ERROR DE SINTAXIS ---
             primary_html = f"""
             <div class="card" style="border: 2px solid {analysis.get('primary_color', '#a0a0a0')}; text-align: center; padding: 25px;">
                 <h1 style="color: {analysis.get('primary_color', '#FAFAFA')}; font-size: 2.8em; margin-bottom: 5px; font-weight: bold;">
@@ -624,6 +656,7 @@ else:
             </div>
             """
             st.markdown(primary_html, unsafe_allow_html=True)
+            # --- FIN CORRECCIÓN ---
 
             # --- INICIO: MENSAJE MFI CONDICIONAL ---
             mfi_score_today = analysis.get('mfi_score', 1)
