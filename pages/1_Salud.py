@@ -8,7 +8,7 @@ import plotly.express as px
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
-    page_title="Coach IA de Readiness v4.3 - Fix", # Versión actualizada
+    page_title="Coach IA de Readiness v4.4 - QuantileFix", # Versión actualizada
     page_icon="🧠",
     layout="wide"
 )
@@ -193,16 +193,34 @@ def get_activity_data(start_date, end_date):
     except requests.exceptions.RequestException: return pd.DataFrame(columns=['trimp', 'aerobic_efficiency'])
 
 
+# --- INICIO: FUNCIÓN 'calculate_baselines' MODIFICADA (v4.4) ---
 def calculate_baselines(daily_df):
-    # ... (sin cambios) ...
+    """
+    Calcula las 3 líneas basales.
+    v4.4: Modificada para usar un lookback FIJO de 60 días para el cuantil de 'recovery',
+          asegurando consistencia en los cálculos entre pestañas.
+    """
     if daily_df.empty or len(daily_df) < 7:
         return {'recovery': pd.Series(dtype='float64'), 'chronic': pd.Series(dtype='float64'), 'historic': pd.Series(dtype='float64')}
+
     cols_to_avg = ['restingHR', 'hrv', 'atl']
     baselines = {}
-    baselines['recovery'] = daily_df[daily_df['atl'] < daily_df['atl'].quantile(0.4)][cols_to_avg].mean()
+    
+    # --- INICIO FIX v4.4: Usar un .tail(60) para el cuantil ---
+    # Esto asegura que el cuantil de 'recovery' sea estable
+    # e independiente de si el dataframe tiene 90 o 150 días de historia.
+    df_hist_60d = daily_df.tail(60)
+    if not df_hist_60d.empty:
+        recovery_quantile = df_hist_60d['atl'].quantile(0.4)
+        baselines['recovery'] = df_hist_60d[df_hist_60d['atl'] < recovery_quantile][cols_to_avg].mean()
+    else:
+        baselines['recovery'] = pd.Series(dtype='float64')
+    # --- FIN FIX v4.4 ---
+
     baselines['chronic'] = daily_df[cols_to_avg].tail(28).mean()
     baselines['historic'] = daily_df[cols_to_avg].tail(60).mean()
     return baselines
+# --- FIN: FUNCIÓN 'calculate_baselines' MODIFICADA ---
 
 
 def calc_IER_v4_personal(rhr_today, tsb, df_history):
@@ -387,11 +405,11 @@ def create_gauge_chart(score, title):
     )
     return fig
 
-# --- INICIO: FUNCIÓN GRÁFICO BULLET MODIFICADA (v4.3) ---
+# --- INICIO: FUNCIÓN GRÁFICO BULLET MODIFICADA (v4.4) ---
 def create_bullet_chart(value, lower_band, upper_band, mean_val, unit, alarm_if_outside):
     """
     Crea un gráfico "bullet" minimalista para el Pilar 3.
-    v4.3: Título eliminado del gráfico, número vuelve a ser el display principal.
+    v4.4: Título eliminado del gráfico, número vuelve a ser el display principal.
     """
     if pd.isna(value): value = 0
     if pd.isna(lower_band) or pd.isna(upper_band) or pd.isna(mean_val):
@@ -428,10 +446,10 @@ def create_bullet_chart(value, lower_band, upper_band, mean_val, unit, alarm_if_
         mode = "gauge+number",
         value = value,
         
-        # --- MODIFICADO v4.3: Número vuelve a ser el display principal ---
+        # --- MODIFICADO v4.4: Número vuelve a ser el display principal ---
         number = {'valueformat': ".1f", 'suffix': f" {unit}", 'font': {'size': 36, 'color': marker_color}},
         
-        # --- MODIFICADO v4.3: Título eliminado del gráfico ---
+        # --- MODIFICADO v4.4: Título eliminado del gráfico ---
         # title = ... (REMOVED)
         
         gauge = {
@@ -473,10 +491,10 @@ def get_readiness_analysis(selected_date, df, mfi_score):
     baselines = {}
     historic_baseline_df = pd.DataFrame()
     if not past_df.empty:
-        baselines = calculate_baselines(past_df)
+        baselines = calculate_baselines(past_df) # <-- Esta función ahora es v4.4 (consistente)
         historic_baseline_df = past_df.tail(min(60, len(past_df)))
         score_s, s_brk = _score_sleep(df_including_today, sleep_score_hoy)
-        score_r, r_brk = _score_rhr(df_including_today, rhr_hoy, baselines)
+        score_r, r_brk = _score_rhr(df_including_today, rhr_hoy, baselines) # <-- Usa baseline consistente
         score_h, h_brk = _score_hrv(df_including_today, hrv_hoy, historic_baseline_df)
         R = max(0, min(100, int(score_s + score_r + score_h)))
         breakdown = s_brk + r_brk + h_brk
@@ -556,21 +574,35 @@ def get_readiness_analysis(selected_date, df, mfi_score):
         "mfi_score": mfi_score
     }
 
-# --- Resto de funciones (generate_range_analysis, etc.) SIN CAMBIOS ---
+# --- INICIO: FUNCIÓN 'generate_range_analysis' MODIFICADA (v4.4) ---
 def generate_range_analysis(fecha_inicio, fecha_fin):
+    """
+    Genera el análisis para un rango de fechas.
+    v4.4: Se asegura de pedir suficiente historia (90 días ANTES del inicio)
+          para que 'calculate_baselines' (que ahora usa .tail(60)) sea consistente.
+    """
+    # Pedir 90 días de historia *antes* de la fecha de inicio para los cálculos
     extended_start = fecha_inicio - timedelta(days=90)
     df_wellness = get_wellness_data(extended_start, fecha_fin)
+    
     if df_wellness.empty:
         return {"error": "No se encontraron datos de bienestar para el rango especificado"}
+    
     range_start, range_end = pd.to_datetime(fecha_inicio), pd.to_datetime(fecha_fin)
     range_wellness = df_wellness[(df_wellness.index >= range_start) & (df_wellness.index <= range_end)]
+    
     if range_wellness.empty:
         return {"error": "No hay datos de bienestar en el rango seleccionado"}
+        
     daily_analysis = []
     default_mfi_for_range = 1
+    
     for date in range_wellness.index:
         try:
+            # Pasamos el dataframe COMPLETO (df_wellness), que incluye la historia
+            # get_readiness_analysis se encargará de cortarlo correctamente
             analysis = get_readiness_analysis(date.date(), df_wellness, default_mfi_for_range)
+            
             if "error" not in analysis:
                 daily_analysis.append({
                     'date': date, 'ier_score': analysis.get('ier_recov_score'), 'readiness_score': analysis.get('readiness_score'),
@@ -581,8 +613,10 @@ def generate_range_analysis(fecha_inicio, fecha_fin):
                 })
         except Exception:
             continue
+            
     if not daily_analysis:
         return {"error": "No se pudieron procesar los análisis diarios"}
+        
     df_analysis = pd.DataFrame(daily_analysis)
     stats = {
         'total_days': len(df_analysis), 'avg_ier': df_analysis['ier_score'].mean(),
@@ -605,6 +639,7 @@ def generate_range_analysis(fecha_inicio, fecha_fin):
         'df_analysis': df_analysis, 'stats': stats, 'distribution': distribution,
         'trend': trend, 'problem_days': problem_days
     }
+# --- FIN: FUNCIÓN 'generate_range_analysis' MODIFICADA ---
 
 
 def create_range_charts(analysis_result):
@@ -703,8 +738,14 @@ def generate_coaching_summary(analysis):
     return f"**Veredicto IA:** {primary_verdict} ({final_recommendation})\n**HRV/RHR Hoy:** {hrv_text} / {rhr_text}\n**Patrón de Pilares:** {patron}"
 
 # --- INTERFAZ PRINCIPAL ---
-st.title("🧠 Coach IA de Readiness v4.3 - Fix") # Título actualizado
+st.title("🧠 Coach IA de Readiness v4.4 - QuantileFix") # Título actualizado
+
+# --- INICIO: MODIFICADO v4.4 ---
+# Aumentado el lookback a 120 días para dar más contexto a la función de baseline
+# y asegurar que `tab1` y `tab3` tengan suficiente historia compartida.
+LOOKBACK_DAYS = 120 
 selected_date = st.date_input("Selecciona la fecha de análisis:", datetime.now().date(), max_value=datetime.now().date())
+# --- FIN: MODIFICADO v4.4 ---
 
 # --- INICIO: WIDGET MFI (Sin cambios) ---
 mfi_options = {0: "😄 Motivado", 1: "🙂 Neutro", 2: "😕 Saturado", 3: "😩 Bloqueado"}
@@ -720,7 +761,8 @@ selected_label = st.radio(
 st.session_state.mfi_score = mfi_labels_to_scores[selected_label]
 # --- FIN: WIDGET MFI ---
 
-df_full = get_wellness_data(selected_date - timedelta(days=90), selected_date)
+# --- MODIFICADO v4.4: Datafetch usa LOOKBACK_DAYS ---
+df_full = get_wellness_data(selected_date - timedelta(days=LOOKBACK_DAYS), selected_date)
 
 if df_full.empty:
     st.warning("No se han podido cargar los datos de bienestar. Revisa la conexión o el rango de fechas.")
@@ -731,10 +773,10 @@ else:
     if "error" in analysis:
         st.error(analysis["error"])
     else:
-        # --- FIX v4.3: Las pestañas ahora se renderizarán ---
+        # --- FIX v4.4: Las pestañas ahora se renderizarán ---
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Readiness Diario", "❤️ Líneas Basales", "🗓️ Resumen por Rango", "🔬 Validación del Modelo"])
         
-        # --- INICIO BLOQUE TAB1 MODIFICADO (v4.3) ---
+        # --- INICIO BLOQUE TAB1 MODIFICADO (v4.4) ---
         with tab1:
             st.subheader("Nivel 1: Veredicto del Coach IA")
             
@@ -795,7 +837,7 @@ else:
             # --- Layout de columnas con Gráficos ---
             p_col1, p_col2, p_col3 = st.columns([3, 3, 4])
             
-            # --- MODIFICADO v4.3: Pilar 1 con Gráfico FIJO y Expander DEBAJO ---
+            # --- MODIFICADO v4.4: Pilar 1 con Gráfico FIJO y Expander DEBAJO ---
             with p_col1:
                 if fig_p1_gauge:
                     st.plotly_chart(fig_p1_gauge, use_container_width=True, config={'displayModeBar': False})
@@ -809,7 +851,7 @@ else:
                     **¿Cómo se interpreta?** Compara tus métricas de *hoy* (HRV, RHR, Sueño) contra tus *basales de recuperación* y tu *historial de 60 días*.
                     """)
 
-            # --- MODIFICADO v4.3: Pilar 2 con Gráfico FIJO y Expander DEBAJO ---
+            # --- MODIFICADO v4.4: Pilar 2 con Gráfico FIJO y Expander DEBAJO ---
             with p_col2:
                 if fig_p2_gauge:
                     st.plotly_chart(fig_p2_gauge, use_container_width=True, config={'displayModeBar': False})
@@ -823,12 +865,12 @@ else:
                     **¿Cómo se interpreta?** Compara tus *medias de 7 días* (HRV, RHR, Sueño) contra tus *medias de 21 días*. Busca una tendencia estable o ascendente.
                     """)
 
-            # --- MODIFICADO v4.3: Pilar 3 con Título ARREGLADO y Sub-etiquetas ---
+            # --- MODIFICADO v4.4: Pilar 3 con Título ARREGLADO y Sub-etiquetas ---
             with p_col3:
                 is_bands_outside = analysis.get('bands_status', {}).get('is_outside', False)
                 p3_style_override = f"border: 2px solid #d9534f !important;" if is_bands_outside else ""
                 
-                # --- BUG FIX v4.3: Título re-añadido ---
+                # --- BUG FIX v4.4: Título re-añadido ---
                 st.markdown(f'''
                 <div class="card" style="padding-bottom: 5px; {p3_style_override}">
                     <h5 style="text-align: center; color: {st.session_state.primary_color}; margin-bottom: 15px;">
@@ -837,7 +879,7 @@ else:
                 </div>
                 ''', unsafe_allow_html=True)
 
-                # --- MODIFICADO v4.3: Sub-etiqueta añadida encima del gráfico ---
+                # --- MODIFICADO v4.4: Sub-etiqueta añadida encima del gráfico ---
                 st.markdown(f"<h6 style='text-align: center; color: {st.session_state.text_color}; margin-top: 5px; margin-bottom: 0px;'>VFC (HRV)</h6>", unsafe_allow_html=True)
                 if fig_hrv_bullet:
                     st.plotly_chart(fig_hrv_bullet, use_container_width=True, config={'displayModeBar': False})
@@ -848,7 +890,7 @@ else:
                 else:
                     st.caption("Datos de HRV insuficientes para gráfico.")
                 
-                # --- MODIFICADO v4.3: Sub-etiqueta añadida encima del gráfico ---
+                # --- MODIFICADO v4.4: Sub-etiqueta añadida encima del gráfico ---
                 st.markdown(f"<h6 style='text-align: center; color: {st.session_state.text_color}; margin-top: 10px; margin-bottom: 0px;'>FC Reposo (RHR)</h6>", unsafe_allow_html=True)
                 if fig_rhr_bullet:
                     st.plotly_chart(fig_rhr_bullet, use_container_width=True, config={'displayModeBar': False})
@@ -928,8 +970,7 @@ else:
                 baselines = calculate_baselines(df_full[df_full.index < pd.to_datetime(selected_date)])
                 
                 # --- INICIO: BUG FIX v4.3 ---
-                # Corregido el bucle (eliminado 'zip' y 'b_col1' etc.)
-                # Corregido 'hrv_tbase' a 'hrv_base'
+                # Corregido 'hrv_tbase' a 'hrv_base' y eliminado 'zip'
                 for key, name in baseline_types.items():
                     rhr_base = baselines.get(key, {}).get('restingHR')
                     hrv_base = baselines.get(key, {}).get('hrv')
@@ -950,6 +991,9 @@ else:
                 st.warning("Se necesitan al menos 7 días de historial para calcular las líneas basales.")
             else:
                 baselines = calculate_baselines(df_para_baselines)
+                
+                # --- INICIO: BUG FIX v4.4 ---
+                # Movido 'b_col1' y el bucle DENTRO del 'else'
                 b_col1, b_col2, b_col3 = st.columns(3)
                 for col, (key, name) in zip([b_col1, b_col2, b_col3], baseline_types.items()):
                     with col:
@@ -960,6 +1004,8 @@ else:
                         st.metric("FC Reposo Media", f"{rhr_base:.1f}" if pd.notna(rhr_base) else "N/A")
                         st.metric("VFC (HRV) Media", f"{hrv_base:.1f}" if pd.notna(hrv_base) else "N/A")
                         st.metric("Fatiga (ATL) Media", f"{atl_base:.1f}" if pd.notna(atl_base) else "N/A")
+                # --- FIN: BUG FIX v4.4 ---
+
             st.markdown("---")
             st.header("📊 Tus Bandas de Normalidad (Lógica del Vídeo)")
             st.info("Calculadas sobre tu historial de 60 días. El 'Pilar 3' comprueba si tu media de 7 días (MA7) se sale de estas bandas.", icon="ℹ️")
@@ -1009,6 +1055,7 @@ else:
                     st.error("La fecha de inicio no puede ser posterior a la fecha de fin.")
                 else:
                     with st.spinner("Generando análisis del rango..."):
+                        # --- MODIFICADO v4.4: Llamada a la función de análisis actualizada ---
                         analysis_result = generate_range_analysis(fecha_inicio, fecha_fin)
                         if "error" in analysis_result:
                             st.error(analysis_result["error"])
@@ -1038,7 +1085,8 @@ else:
             st.header("🔬 Validación del Modelo (IER vs Readiness)")
             st.info("Esta pestaña compara la evolución de los dos scores para validar su comportamiento. El IER (azul) debe ser más estable y marcar tendencias, mientras que el Readiness (rojo) puede ser más volátil y reflejar el estado del día.", icon="ℹ️")
             with st.spinner("Calculando datos históricos para validación..."):
-                df_hist_full = get_wellness_data(datetime.now().date() - timedelta(days=90), datetime.now().date())
+                # --- MODIFICADO v4.4: Datafetch usa LOOKBACK_DAYS ---
+                df_hist_full = get_wellness_data(datetime.now().date() - timedelta(days=LOOKBACK_DAYS), datetime.now().date())
                 validation_data = []
                 default_mfi_for_validation = 1 # Usar MFI neutro para validación histórica
                 for date in df_hist_full.index:
