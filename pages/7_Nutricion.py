@@ -1,221 +1,214 @@
 import streamlit as st
-import google.generative_ai as genai
+import requests
 import json
+import base64
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
+from PIL import Image
+from io import BytesIO
 
-# --- ⚙ CONFIGURACIÓN ---
-# Configura tu página
+# --- ⚙ CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(
-    page_title="NutriScan AI",
+    page_title="NutriScan AI - Control de Minerales",
     page_icon="🥑",
-    layout="centered",
-    initial_sidebar_state="collapsed"
+    layout="centered"
 )
 
-# Estilos CSS para intentar imitar "App Móvil"
+# Estilos CSS para mejorar la legibilidad en móviles
 st.markdown("""
     <style>
-    .stButton>button {
-        width: 100%;
-        border-radius: 12px;
-        height: 3em;
-        font-weight: bold;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        text-align: center;
-        margin-bottom: 10px;
-    }
-    /* Ocultar menú hamburguesa y footer para limpieza */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+    .stButton>button { width: 100%; border-radius: 12px; height: 3.5em; font-weight: bold; }
+    .metric-card { background-color: #f0f2f6; padding: 20px; border-radius: 15px; text-align: center; margin-bottom: 15px; border: 1px solid #e0e0e0; }
+    .advice-box { background-color: #e8f4f8; padding: 15px; border-radius: 10px; border-left: 5px solid #2980b9; margin: 10px 0; }
+    [data-testid="stMetricValue"] { font-size: 1.8rem !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 🔑 API KEY ---
-# En Streamlit Cloud, esto va en los "Secrets". Localmente puedes ponerla directa (no recomendado para compartir).
-# st.secrets["GOOGLE_API_KEY"]
+# --- 🔑 CONFIGURACIÓN DE API KEY ---
+# Intentamos obtenerla de los secretos de Streamlit (nube) o la pedimos en pantalla (local)
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
 except:
-    api_key = st.text_input("Introduce tu Google API Key:", type="password")
+    api_key = st.text_input("🔑 Introduce tu Google API Key para activar la IA:", type="password")
 
 if not api_key:
-    st.warning("⚠️ Por favor, introduce tu API Key para continuar.")
+    st.warning("⚠ Se requiere la clave de API para analizar imágenes y dar consejos.")
     st.stop()
 
-genai.configure(api_key=api_key)
+# --- 🧠 MOTOR DE INTELIGENCIA ARTIFICIAL (GEMINI REST) ---
 
-# --- 🧠 LÓGICA IA ---
-
-def analyze_image(image_data):
-    """Envía la imagen a Gemini Flash para análisis nutricional."""
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    prompt = """
-    Actúa como nutricionista experto. Analiza esta imagen de comida.
-    Identifica el plato y estima sus valores nutricionales.
-    
-    IMPORTANTE: Devuelve SIEMPRE sodium, potassium, calcium, magnesium en "minerals" (aunque sean 0).
-    Si ves otros importantes, ponlos en "other_minerals".
-    
-    Responde SOLO con este JSON válido (sin markdown ```json):
-    {
-      "foodName": "Nombre del plato",
-      "estimatedWeight_g": numero_peso,
-      "calories": numero_calorias,
-      "macros": { "protein_g": numero, "carbs_g": numero, "fat_g": numero },
-      "minerals": { "sodium_mg": numero, "potassium_mg": numero, "calcium_mg": numero, "magnesium_mg": numero },
-      "analysis": "Breve comentario de 1 frase."
-    }
+def call_gemini_api(prompt, image=None):
     """
+    Función robusta para conectar con Gemini 2.0 Flash vía HTTPS directo.
+    Compatible con Python 3.13 al no depender de librerías externas complejas.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    headers = {'Content-Type': 'application/json'}
     
+    parts = [{"text": prompt}]
+    
+    if image:
+        # Convertimos la imagen a formato que la IA entiende (Base64)
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": img_str
+            }
+        })
+
+    payload = {"contents": [{"parts": parts}]}
+
     try:
-        response = model.generate_content([prompt, image_data])
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        return result['candidates'][0]['content']['parts'][0]['text']
     except Exception as e:
-        st.error(f"Error analizando imagen: {e}")
+        st.error(f"❌ Error de conexión con Gemini: {str(e)}")
         return None
 
-def ask_coach(history_data):
-    """Consulta al Coach IA."""
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    prompt = f"""
-    Eres un entrenador personal para un deportista con FA Vagal.
-    Datos de hoy: {json.dumps(history_data)}
-    Dame 3 consejos breves y técnicos para recuperación hoy. Usa emojis.
+def analyze_food(image_input):
+    """Analiza la imagen para extraer macros y minerales."""
+    prompt = """
+    Analiza esta imagen como un nutricionista clínico experto. 
+    1. Identifica el alimento.
+    2. Calcula ración estándar en gramos.
+    3. Devuelve calorías, Proteína, Carbohidratos y Grasa.
+    4. IMPORTANTE: Devuelve mg de Sodio (sodium), Potasio (potassium), Calcio (calcium) y Magnesio (magnesium).
+    
+    Responde ÚNICAMENTE con este formato JSON:
+    {
+      "foodName": "Nombre plato",
+      "weight_g": 250,
+      "calories": 450,
+      "macros": {"protein_g": 20, "carbs_g": 50, "fat_g": 15},
+      "minerals": {"sodium_mg": 400, "potassium_mg": 350, "calcium_mg": 100, "magnesium_mg": 40},
+      "analysis": "Breve nota sobre el balance de este plato."
+    }
     """
-    response = model.generate_content(prompt)
-    return response.text
+    raw_response = call_gemini_api(prompt, image_input)
+    if raw_response:
+        try:
+            # Limpiar posibles marcas de markdown de la IA
+            clean_json = raw_response.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_json)
+        except:
+            st.error("La IA tuvo un problema de formato. Por favor, intenta de nuevo.")
+    return None
 
-def get_recipes(food_name):
-    """Pide recetas."""
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    prompt = f"Dame 2 ideas de recetas rápidas y saludables usando: {food_name}. Sé breve."
-    response = model.generate_content(prompt)
-    return response.text
-
-# --- 💾 GESTIÓN DE ESTADO (MEMORIA TEMPORAL) ---
-if 'history' not in st.session_state:
-    st.session_state.history = []
-if 'current_analysis' not in st.session_state:
-    st.session_state.current_analysis = None
+# --- 💾 GESTIÓN DE DATOS ---
+if 'nutri_history' not in st.session_state:
+    st.session_state.nutri_history = []
+if 'last_analysis' not in st.session_state:
+    st.session_state.last_analysis = None
 
 # --- 📱 INTERFAZ DE USUARIO ---
 
-# Título
 st.title("🥑 NutriScan AI")
-st.caption("Tu escáner de macros y minerales para FA Vagal")
+st.write(f"Hola Jose, monitor de nutrición y minerales.")
 
-# Pestañas de navegación
-tab1, tab2 = st.tabs(["📸 Escáner", "📅 Diario"])
+tabs = st.tabs(["📸 Escáner", "📅 Diario de Hoy", "🧠 Coach IA"])
 
-# --- PESTAÑA 1: ESCÁNER ---
-with tab1:
-    st.write("### ¿Qué comemos hoy?")
+# TRAYECTO 1: ESCÁNER
+with tabs[0]:
+    st.subheader("Registrar Alimento")
+    metodo = st.radio("Origen de la imagen:", ["Cámara en vivo", "Galería/Archivo"], horizontal=True)
     
-    input_method = st.radio("Método de entrada:", ["Cámara", "Subir Foto"], horizontal=True, label_visibility="collapsed")
-    
-    image_file = None
-    if input_method == "Cámara":
-        image_file = st.camera_input("Haz una foto")
+    if metodo == "Cámara en vivo":
+        foto = st.camera_input("Enfoca tu plato")
     else:
-        image_file = st.file_uploader("Sube una imagen", type=['jpg', 'png', 'jpeg'])
+        foto = st.file_uploader("Sube una foto de tu comida", type=['jpg', 'jpeg', 'png'])
 
-    if image_file:
-        # Convertir a imagen PIL para mostrar y procesar
-        from PIL import Image
-        img = Image.open(image_file)
-        
-        if st.button("🔍 Analizar Alimento", type="primary"):
-            with st.spinner("La IA está pesando los ingredientes..."):
-                result = analyze_image(img)
-                if result:
-                    st.session_state.current_analysis = result
+    if foto:
+        img = Image.open(foto)
+        if st.button("🔍 ANALIZAR AHORA", type="primary"):
+            with st.spinner("La IA está analizando los componentes..."):
+                resultado = analyze_food(img)
+                if resultado:
+                    st.session_state.last_analysis = resultado
                     st.success("¡Análisis completado!")
 
-    # MOSTRAR RESULTADOS
-    if st.session_state.current_analysis:
-        data = st.session_state.current_analysis
-        
+    # Mostrar resultados del último análisis
+    if st.session_state.last_analysis:
+        res = st.session_state.last_analysis
         st.divider()
-        st.header(data['foodName'])
-        st.caption(f"⚖️ {data['estimatedWeight_g']}g • 🔥 {data['calories']} Kcal")
+        st.header(f"🍴 {res['foodName']}")
         
-        # Gráfico de Macros (Donut)
-        labels = ['Proteína', 'Carbos', 'Grasa']
-        values = [data['macros']['protein_g'], data['macros']['carbs_g'], data['macros']['fat_g']]
-        colors = ['#10b981', '#f59e0b', '#ef4444']
-        
-        fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=.5, marker_colors=colors)])
-        fig.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=200, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Macros numéricos
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Prot", f"{data['macros']['protein_g']}g")
-        c2.metric("Carb", f"{data['macros']['carbs_g']}g")
-        c3.metric("Grasa", f"{data['macros']['fat_g']}g")
-        
-        st.subheader("💧 Minerales")
-        m1, m2 = st.columns(2)
-        m1.info(f"**Sodio:** {data['minerals']['sodium_mg']} mg")
-        m2.success(f"**Potasio:** {data['minerals']['potassium_mg']} mg")
-        m3, m4 = st.columns(2)
-        m3.warning(f"**Calcio:** {data['minerals']['calcium_mg']} mg")
-        m4.info(f"**Magnesio:** {data['minerals']['magnesium_mg']} mg")
-        
-        col_btn1, col_btn2 = st.columns(2)
-        
-        if col_btn1.button("💾 Guardar en Diario"):
-            # Añadir fecha
-            entry = data.copy()
-            entry['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            st.session_state.history.append(entry)
-            st.toast("Guardado en el historial", icon="✅")
-            st.session_state.current_analysis = None # Reset
-            st.rerun()
-            
-        if col_btn2.button("👨‍🍳 Ideas Recetas"):
-            ideas = get_recipes(data['foodName'])
-            st.info(ideas)
+        col_data1, col_data2 = st.columns(2)
+        col_data1.metric("🔥 Calorías", f"{res['calories']} kcal")
+        col_data2.metric("⚖️ Peso Est.", f"{res['weight_g']} g")
 
-# --- PESTAÑA 2: DIARIO ---
-with tab2:
-    if not st.session_state.history:
-        st.info("No hay registros hoy. ¡Escanea algo!")
+        # Gráfico de Macros
+        labels = ['Proteína', 'Carbos', 'Grasa']
+        m_values = [res['macros']['protein_g'], res['macros']['carbs_g'], res['macros']['fat_g']]
+        fig = go.Figure(data=[go.Pie(labels=labels, values=m_values, hole=.4, marker_colors=['#27ae60', '#f1c40f', '#e74c3c'])])
+        fig.update_layout(height=250, margin=dict(l=0, r=0, t=0, b=0), showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.write("### 💧 Aporte de Minerales")
+        min1, min2 = st.columns(2)
+        min1.write(f"🧂 **Sodio:** {res['minerals']['sodium_mg']} mg")
+        min1.write(f"🍌 **Potasio:** {res['minerals']['potassium_mg']} mg")
+        min2.write(f"🦴 **Calcio:** {res['minerals']['calcium_mg']} mg")
+        min2.write(f"💊 **Magnesio:** {res['minerals']['magnesium_mg']} mg")
+
+        if st.button("💾 GUARDAR EN MI DIARIO"):
+            res['time'] = datetime.now().strftime("%H:%M")
+            st.session_state.nutri_history.append(res)
+            st.session_state.last_analysis = None
+            st.toast("Guardado correctamente", icon="✅")
+            st.rerun()
+
+# TRAYECTO 2: DIARIO
+with tabs[1]:
+    if not st.session_state.nutri_history:
+        st.info("Todavía no has registrado nada hoy. ¡Usa la cámara!")
     else:
-        # Calcular totales
-        df = pd.DataFrame(st.session_state.history)
-        total_cal = sum(d['calories'] for d in st.session_state.history)
-        total_na = sum(d['minerals']['sodium_mg'] for d in st.session_state.history)
-        total_k = sum(d['minerals']['potassium_mg'] for d in st.session_state.history)
+        # Calcular totales del día
+        total_c = sum(i['calories'] for i in st.session_state.nutri_history)
+        total_na = sum(i['minerals']['sodium_mg'] for i in st.session_state.nutri_history)
+        total_k = sum(i['minerals']['potassium_mg'] for i in st.session_state.nutri_history)
         
-        # Tarjeta Resumen
         st.markdown(f"""
-        <div class="metric-card">
-            <h3>Total Hoy</h3>
-            <h1 style="color: #15803d;">{total_cal} Kcal</h1>
-            <p>Na: {total_na}mg | K: {total_k}mg</p>
-        </div>
+            <div class="metric-card">
+                <p style="margin:0; font-weight:bold; color:#7f8c8d;">CONSUMO TOTAL HOY</p>
+                <h1 style="margin:0; color:#2ecc71;">{total_c} <span style="font-size:15px;">Kcal</span></h1>
+                <p style="margin:5px 0 0 0;">🧂 Na: {total_na}mg | 🍌 K: {total_k}mg</p>
+            </div>
         """, unsafe_allow_html=True)
-        
-        # Botón Coach
-        if st.button("✨ Análisis del Coach IA"):
-            with st.spinner("Analizando tu día..."):
-                advice = ask_coach(st.session_state.history)
-                st.success(advice)
-        
-        st.subheader("Historial")
-        for i, item in enumerate(reversed(st.session_state.history)):
-            with st.expander(f"{item['timestamp'][-5:]} - {item['foodName']} ({item['calories']} kcal)"):
+
+        st.subheader("Desglose del día")
+        for i, item in enumerate(reversed(st.session_state.nutri_history)):
+            with st.expander(f"{item['time']} - {item['foodName']} ({item['calories']} kcal)"):
                 st.write(f"**Macros:** P: {item['macros']['protein_g']}g | C: {item['macros']['carbs_g']}g | G: {item['macros']['fat_g']}g")
-                st.write(f"**Minerales:** Na: {item['minerals']['sodium_mg']} | K: {item['minerals']['potassium_mg']}")
-                if st.button("Borrar", key=f"del_{i}"):
-                    st.session_state.history.pop(-(i+1))
+                st.write(f"**Minerales:** Na: {item['minerals']['sodium_mg']}mg | K: {item['minerals']['potassium_mg']}mg")
+                if st.button(f"🗑 Eliminar", key=f"del_{i}"):
+                    st.session_state.nutri_history.pop(-(i+1))
                     st.rerun()
+
+# TRAYECTO 3: COACH
+with tabs[2]:
+    st.subheader("Análisis de Salud Deportiva")
+    if not st.session_state.nutri_history:
+        st.warning("Añade algunas comidas primero para que el Coach pueda analizar tu día.")
+    else:
+        if st.button("✨ CONSULTAR AL COACH GEMINI"):
+            with st.spinner("Analizando balance Na/K y estado mineral..."):
+                datos_hoy = json.dumps(st.session_state.nutri_history)
+                prompt_coach = f"""
+                Actúa como un experto en nutrición deportiva para un atleta de 54 años preocupado por la FA Vagal.
+                Datos de comidas de hoy: {datos_hoy}
+                
+                Analiza:
+                1. El balance Sodio/Potasio.
+                2. Si el Magnesio es suficiente para la recuperación.
+                3. Da 3 consejos breves y técnicos para lo que queda de día o para mañana.
+                Usa emojis y sé muy directo.
+                """
+                consejo = call_gemini_api(prompt_coach)
+                if consejo:
+                    st.markdown(f'<div class="advice-box">{consejo}</div>', unsafe_allow_html=True)
