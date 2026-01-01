@@ -6,4 +6,5 @@ seaborn
 matplotlib
 plotly>=5.0.0
 python-docx
+plotly
 google-generative-ai
