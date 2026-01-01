@@ -1,14 +1,10 @@
 streamlit
 requests
-pandas
 numpy
 seaborn
 matplotlib
 plotly>=5.0.0
 python-docx
 google-generative-ai
-streamlit
-google-generative-ai
 pandas
-plotly
 Pillow
